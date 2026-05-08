@@ -1,1 +1,128 @@
-hello sample file here
+fef-flink-engine: Comprehensive Technical Documentation
+Date: May 8, 2026
+
+Table of Contents
+Project Overview
+High-Level Architecture and Flow
+Distributed Validation and Parquet Comparison
+Key Classes and Their Roles
+ParquetPreChecks
+ParquetGroupBulkFormat
+ParallelParquetRowGroupSource
+ParquetService
+UpdatedValueComparator
+Distributed Job Execution in Flink
+Validation and Comparison Implementation Details
+Error Handling and Reporting
+Configuration and Deployment
+Glossary
+References
+1. Project Overview
+fef-flink-engine is a distributed data validation and comparison engine built on Apache Flink. Its primary use case is the scalable, parallel comparison of large Parquet files, supporting field-level validation, join-key-driven and subset comparisons, and robust error reporting. The engine is designed for high throughput, context isolation, and thread safety, making it suitable for enterprise-scale data validation pipelines.
+
+2. High-Level Architecture and Flow
+Three-Level Parallelism:
+Pipeline Level: Multiple validation pipelines can run concurrently.
+Validation Level: Each validation scenario (e.g., a Gherkin scenario) is executed in its own isolated context, preventing race conditions and ensuring thread safety.
+Scenario Level: Within each scenario, distributed tasks (e.g., Parquet file comparisons) are parallelized across Flink TaskManagers.
+Context Isolation: Each scenario is provided a separate execution context, leveraging Flink's distributed state and thread-safe data structures (e.g., ConcurrentHashMap).
+Distributed Parquet Comparison:
+Parquet files are read in parallel using custom Flink BulkFormat and SourceFunction implementations.
+Work is split by row group or file chunk, enabling efficient scaling across TaskManagers.
+Pre-Checks: Fast record count and schema checks are performed before field-level comparison to catch obvious mismatches early.
+Field-to-Field Hashing: Each record's fields are hashed using a custom materializer/converter, enabling efficient distributed comparison and deduplication.
+Sort-Merge Join for Large Files: For very large files, a batch mode with sort-merge join is used to avoid memory issues and enable scalable comparison.
+3. Distributed Validation and Parquet Comparison
+File Reading:
+Uses Flink's FileSource with custom BulkFormat (ParquetGroupBulkFormat) to read Parquet files in parallel.
+Each TaskManager processes a subset of row groups or file splits.
+Hashing and Tagging:
+Each record is materialized and its fields are hashed (see HashComputingMaterializer).
+Records are tagged with their origin (source/target) and join key (if applicable).
+Comparison Logic:
+In join-key-driven mode, records are matched by join key and compared field-by-field.
+In subset mode, all records are compared without a join key.
+Field-level comparison uses robust type normalization (see UpdatedValueComparator).
+Pre-Checks:
+Row count and schema checks are performed before distributed comparison (see ParquetPreChecks).
+Error Reporting:
+Mismatches and errors are collected and reported with detailed context.
+4. Key Classes and Their Roles
+ParquetPreChecks
+Purpose: Performs fast pre-checks on Parquet files (row count, schema) before distributed comparison.
+Key Methods:
+checkCounts(String sourcePath, String targetPath): Compares row counts.
+checkSchemas(String sourcePath, String targetPath): Compares schemas field-by-field.
+Role: Catches obvious mismatches early, saving compute resources.
+ParquetGroupBulkFormat
+Purpose: Custom Flink BulkFormat for parallel reading of Parquet files.
+Key Methods:
+computeGroupHash(Group group): Hashes each field value in a record.
+Role: Enables efficient, parallel extraction of join keys and field hashes for distributed comparison.
+ParallelParquetRowGroupSource
+Purpose: Implements a parallel Flink SourceFunction that reads Parquet row groups in parallel.
+Key Methods:
+HashComputingMaterializer: Streams field values directly into a hash computation.
+Role: Emits tagged records with computed hashes for distributed comparison.
+ParquetService
+Purpose: Orchestrates Parquet file validation, including join-key-driven and subset comparison, field-level checks, and error reporting.
+Key Methods:
+Field-level comparison loop: Compares each field using UpdatedValueComparator.
+Role: Central service for managing validation flow and aggregating results.
+UpdatedValueComparator
+Purpose: Implements robust, type-aware field comparison logic.
+Key Methods:
+valueEquals(Object s, Object t): Handles BigDecimal, byte[], array normalization, and numeric comparison.
+Role: Ensures accurate, type-safe field comparison across distributed tasks.
+5. Distributed Job Execution in Flink
+Task Distribution:
+Flink splits Parquet files into row groups or file splits, assigning each to a TaskManager slot.
+Each TaskManager runs a parallel instance of the custom source/format, processing its assigned data.
+Parallelism:
+Configurable via Flink job parameters and cluster resources.
+Enables horizontal scaling for large datasets.
+Context Isolation:
+Each scenario runs in its own context, with thread-safe data structures to prevent race conditions.
+Thread Safety:
+Uses ConcurrentHashMap and other thread-safe constructs for shared state.
+6. Validation and Comparison Implementation Details
+Pre-Checks:
+Fast row count and schema checks using ParquetPreChecks.
+Field-Level Comparison:
+Records are matched (by join key or subset) and compared field-by-field.
+Hashing is used to efficiently identify and deduplicate records.
+Type normalization ensures accurate comparison (e.g., BigDecimal, byte[], arrays).
+Sort-Merge Join:
+For large files, a batch mode with sort-merge join is used to avoid OOM and enable scalable comparison.
+Error Handling:
+Mismatches and errors are collected with detailed context for reporting.
+7. Error Handling and Reporting
+Error Collection:
+All mismatches and errors are aggregated and reported at the end of each validation scenario.
+Reporting:
+Detailed error reports include field names, expected/actual values, and context.
+Thread Safety:
+Error collection is thread-safe, ensuring accurate reporting in distributed scenarios.
+8. Configuration and Deployment
+Configuration:
+Flink job parameters (parallelism, memory, etc.) are configurable via YAML files and command-line arguments.
+Parquet file paths, join keys, and validation scenarios are specified in configuration files or job parameters.
+Deployment:
+Supports deployment on local clusters, Docker, and OpenShift.
+See README.md and deployment scripts for setup instructions.
+9. Glossary
+Flink: Distributed data processing engine for batch and stream processing.
+Parquet: Columnar storage file format optimized for big data workloads.
+TaskManager: Flink component that executes tasks in parallel.
+BulkFormat: Flink interface for reading data in bulk from files.
+RecordMaterializer: Parquet API for converting raw data into usable records.
+Join Key: Field(s) used to match records between source and target files.
+Sort-Merge Join: Algorithm for joining large datasets by sorting and merging.
+10. References
+README.md
+ARCHITECTURE_DIAGRAM.md
+COMPLETE_READER_ANALYSIS.md
+PARQUET_LARGE_FILE_IMPLEMENTATION_PLAN.md
+SUMMARY_OF_CHANGES.md
+Java source files in fef-validation-common/src/main/java/com/fiserv/fef/parquet/distributed/
+This documentation is current as of May 8, 2026. For updates, refer to the project repository and associated documentation files.
