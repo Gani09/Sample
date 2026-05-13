@@ -1,0 +1,6 @@
+package com.fiserv.fef.parquet.filter;
+
+public enum Operator {
+    EQ, NE, GT, GTE, LT, LTE, IN,
+    NONE // join-key only
+}
