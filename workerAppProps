@@ -1,0 +1,25 @@
+# Worker Job Configuration
+worker.job.name=FEF Worker Validation Job
+
+# MongoDB Configuration
+mongodb.uri=${MONGODB_URI:mongodb://optisdevuser:Welc0me24@otp-mongodb-msr-omh-dev.1dc.com:27017/?authSource=admin&connectTimeoutMS=600000&tls=false}
+# SEP data database (for validation data access)
+mongodb.database=${MONGODB_DATABASE:Card_Issuer_Sync}
+# FEF collections database (for pipeline, registry, results, features)
+mongodb.fef.database=${MONGODB_FEF_DATABASE:Optis_fef_config_db}
+
+# Validation Configuration
+validation.gherkin.scenario.parallelism=4
+validation.execution.timeout=600000
+
+# Step Definition Configuration
+stepdefs.package=com.fiserv.fef.stepdefs
+stepdefs.auto-scan=true
+
+# Kafka and SSL configurations
+kafka.topics=otp-dev-servicingorder-account-created:AP-NA-cot-kafka-group,otp-dev-producer-audit:optis-eod
+kafka.bootstrapServer=localhost:9092
+#kafka.bootstrapServer=syld2ak1eki0004.1dc.com:9094, syld2ak1eki0005.1dc.com:9094, syld2ak1eki0006.1dc.com:9094, syld2ak1eki0001.1dc.com:9094, syld2ak1eki0002.1dc.com:9094, syld2ak1eki0003.1dc.com:9094
+#kafka.ssl.keystore.location=/work/certs/dev-kafka-keystore.jks
+#kafka.ssl.truststore.location=/work/certs/dev-kafka-truststore.jks
+#kafka.ssl.pwd=${KAFKA_SSL_PWD}
