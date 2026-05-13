@@ -1,0 +1,73 @@
+package com.fiserv.fef;
+
+import com.fiserv.fef.hadoop.HadoopClientManager;
+import com.fiserv.fef.parquet.util.AdaptiveParquetRowCount;
+import com.fiserv.fef.parquet.schema.ParquetSchemaAssertions;
+import com.fiserv.fef.utils.PropertiesUtil;
+
+public class ParquetSchemaValidationMain {
+
+    public static void main(String[] args) throws Exception {
+
+        final PropertiesUtil props = PropertiesUtil.getInstance();
+
+        // 1) Resolve properties (allow CLI overrides)
+        String srcFile = argOrProp(args, 0, props, "parquet.inbound", "");
+        String tgtFile = argOrProp(args, 1, props, "parquet.outbound", "");
+
+
+        String fsDefault = PropertiesUtil.getInstance()
+                .getProperty("fs.defaultFS", "file:///");
+
+        try (HadoopClientManager.HadoopClientContext hCtx =
+                     HadoopClientManager.acquire(fsDefault)) {
+
+            int maxLines = Integer.parseInt(
+                    PropertiesUtil.getInstance()
+                            .getProperty("parquet.diff.max.lines", "25")
+            );
+
+            // -------------------------------------------------
+            // SCHEMA VALIDATION (logs schema + fingerprint)
+            // -------------------------------------------------
+            ParquetSchemaAssertions.assertSchemasMatch(
+                    hCtx, srcFile, tgtFile, maxLines
+            );
+
+            System.out.println("✅ Schema validation PASSED");
+
+            // -------------------------------------------------
+            // RECORD COUNT VALIDATION (logs counts)
+            // -------------------------------------------------
+            AdaptiveParquetRowCount.Result src =
+                    AdaptiveParquetRowCount.count(hCtx, srcFile);
+            AdaptiveParquetRowCount.Result tgt =
+                    AdaptiveParquetRowCount.count(hCtx, tgtFile);
+
+            System.out.println("Source rows : " + src.rowCount +
+                    " (" + src.source + ")");
+            System.out.println("Target rows : " + tgt.rowCount +
+                    " (" + tgt.source + ")");
+
+            if (src.rowCount != tgt.rowCount) {
+                throw new AssertionError(
+                        "Record count mismatch\n" +
+                                "source=" + src.rowCount + " (" + src.source + ")\n" +
+                                "target=" + tgt.rowCount + " (" + tgt.source + ")"
+                );
+            }
+
+            System.out.println("✅ Record count validation PASSED");
+        }
+
+        System.out.println("✅✅ All validations completed successfully");
+    }
+
+
+    private static String argOrProp(String[] args, int idx, PropertiesUtil props, String key, String def) {
+        if (args != null && args.length > idx && args[idx] != null && !args[idx].isBlank()) {
+            return args[idx].trim();
+        }
+        return props.getProperty(key, def);
+    }
+}
