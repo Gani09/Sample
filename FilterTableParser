@@ -1,0 +1,88 @@
+package com.fiserv.fef.stepdefs;
+
+import com.fiserv.fef.gherkin.SimpleDataTable;
+
+import java.util.*;
+
+/**
+ * Parses the Gherkin filter DataTable:
+ *   | filter_key | condition | filter_value | value_type |
+ *
+ * into:
+ *  - canonical filter string: key:value,key2:value2
+ *  - joinKeys list (defaults to filter_key values in table order)
+ *
+ * Notes:
+ *  - value_type is OPTIONAL and treated as a hint (ignored by default; schema-driven decoding applies)
+ *  - condition is OPTIONAL; default is 'eq'
+ *  - current Parquet filter pipeline supports only 'eq'
+ */
+public final class FilterTableParser {
+
+    private FilterTableParser() {}
+
+    public static final class ParseResult {
+        public final String filterString;
+        public final List<String> joinKeys;
+
+        public ParseResult(String filterString, List<String> joinKeys) {
+            this.filterString = filterString;
+            this.joinKeys = Collections.unmodifiableList(new ArrayList<>(joinKeys));
+        }
+    }
+
+    /** Backward compatible: return only filter string */
+    public static String toKeyValueFilterString(SimpleDataTable dataTable) {
+        return parse(dataTable).filterString;
+    }
+
+    /** New: returns filter string + joinKeys (filter_key values) */
+    public static ParseResult parse(SimpleDataTable dataTable) {
+        if (dataTable == null || dataTable.isEmpty()) {
+            return new ParseResult("", List.of());
+        }
+
+        StringBuilder sb = new StringBuilder();
+        List<String> joinKeys = new ArrayList<>();
+
+        List<Map<String, String>> rows = dataTable.asMaps(String.class, String.class);
+        for (Map<String, String> row : rows) {
+            if (row == null) continue;
+
+            String key = firstNonBlank(row.get("filter_key"), row.get("filterKey"), row.get("key"));
+            String cond = firstNonBlank(row.get("condition"), row.get("operator"), row.get("op"));
+            String value = firstNonBlank(row.get("filter_value"), row.get("filterValue"), row.get("value"));
+            // optional hint (not used today)
+            String valueType = firstNonBlank(row.get("value_type"), row.get("valueType"), row.get("type"));
+
+            if (key == null || key.isBlank()) continue;
+            if (value == null) value = "";
+
+            String condition = (cond == null || cond.isBlank()) ? "eq" : cond.trim().toLowerCase(Locale.ROOT);
+            if (!"eq".equals(condition)) {
+                throw new UnsupportedOperationException(
+                        "Unsupported filter condition '" + condition + "' for key '" + key + "'. " +
+                                "Current Parquet filter pipeline supports only 'eq'.");
+            }
+
+            // Add key to joinKeys (preserve order, avoid duplicates)
+            String k = key.trim();
+            if (!joinKeys.contains(k)) {
+                joinKeys.add(k);
+            }
+
+            if (sb.length() > 0) sb.append(", ");
+            sb.append(k).append(":").append(value.trim());
+        }
+
+        return new ParseResult(sb.toString(), joinKeys);
+    }
+
+    private static String firstNonBlank(String... vals) {
+        if (vals == null) return null;
+        for (String v : vals) {
+            if (v != null && !v.isBlank()) return v;
+        }
+        return null;
+    }
+}
