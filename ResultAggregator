@@ -1,0 +1,83 @@
+package com.fiserv.fef.gherkin;
+
+import com.fiserv.fef.models.ProcessValidationResult;
+import com.fiserv.fef.models.ValidationResult;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.List;
+
+/**
+ * Aggregates validation results for reporting
+ */
+public class ResultAggregator {
+
+    private static final Logger LOG = LoggerFactory.getLogger(ResultAggregator.class);
+
+    /**
+     * Aggregate validation results into process result
+     */
+    public static ProcessValidationResult aggregate(
+            String processID,
+            String processName,
+            List<ValidationResult> validationResults
+    ) {
+        LOG.debug("Aggregating {} validation results", validationResults.size());
+
+        ProcessValidationResult processResult = new ProcessValidationResult(processID, processName);
+
+        for (ValidationResult result : validationResults) {
+            processResult.addValidationResult(result);
+        }
+
+        processResult.markComplete();
+
+        LOG.info("Aggregation complete: process={}, total={}, passed={}, failed={}",
+                processID,
+                processResult.getTotalValidations(),
+                processResult.getPassedValidations(),
+                processResult.getFailedValidations()
+        );
+
+        return processResult;
+    }
+
+    /**
+     * Create summary string for results
+     */
+    public static String createSummary(ProcessValidationResult result) {
+        StringBuilder summary = new StringBuilder();
+
+        summary.append("Process: ").append(result.getProcessName()).append("\n");
+        summary.append("Status: ").append(result.allPassed() ? "PASSED" : "FAILED").append("\n");
+        summary.append("Total Validations: ").append(result.getTotalValidations()).append("\n");
+        summary.append("Passed: ").append(result.getPassedValidations()).append("\n");
+        summary.append("Failed: ").append(result.getFailedValidations()).append("\n");
+        summary.append("Duration: ").append(result.getTotalDurationMs()).append("ms\n");
+
+        // Add failed validation details
+        if (result.getFailedValidations() > 0) {
+            summary.append("\nFailed Validations:\n");
+            for (ValidationResult vr : result.getValidationResults()) {
+                if (!vr.isPassed()) {
+                    summary.append("  - ").append(vr.getValidationID())
+                            .append(": ").append(vr.getErrorMessage())
+                            .append("\n");
+                }
+            }
+        }
+
+        return summary.toString();
+    }
+
+    /**
+     * Calculate pass rate
+     */
+    public static double calculatePassRate(ProcessValidationResult result) {
+        if (result.getTotalValidations() == 0) {
+            return 0.0;
+        }
+
+        return (double) result.getPassedValidations() / result.getTotalValidations() * 100.0;
+    }
+}
