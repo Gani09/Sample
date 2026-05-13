@@ -1,0 +1,66 @@
+package com.fiserv.fef.parquet.validation;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * Scenario-scoped ValidationContext holder.
+ * ThreadLocal-based to support parallel execution.
+ */
+public final class ScenarioContextHolder {
+
+    private static final Logger LOG = LoggerFactory.getLogger(ScenarioContextHolder.class);
+    private static final ThreadLocal<ValidationContext> CTX = new ThreadLocal<>();
+
+    private ScenarioContextHolder() {
+    }
+
+    /**
+     * Initialize a fresh ValidationContext for the current thread.
+     * Defensive: clears any prior context first (safe for thread reuse).
+     */
+    public static ValidationContext init(String reason) {
+        clear("re-init");
+        ValidationContext ctx = new ValidationContext();
+        CTX.set(ctx);
+        LOG.info("[ScenarioContext] INIT thread={}({}) ctxId={} reason={}",
+                Thread.currentThread().getName(), Thread.currentThread().getId(),
+                System.identityHashCode(ctx), reason);
+        return ctx;
+    }
+
+    /**
+     * Get the current thread's context; lazily initializes if missing.
+     * Logs a WARN because lazy-init usually indicates hook ordering / missing hook.
+     */
+    public static ValidationContext getOrInit() {
+        ValidationContext ctx = CTX.get();
+        if (ctx == null) {
+            LOG.warn("[ScenarioContext] LAZY-INIT thread={}({}) reason={}",
+                    Thread.currentThread().getName(), Thread.currentThread().getId(),
+                    "lazy-init");
+            ctx = init("lazy-init");
+        }
+        return ctx;
+    }
+
+    /**
+     * Clear the current thread's context.
+     */
+    public static void clear(String reason) {
+        ValidationContext ctx = CTX.get();
+        if (ctx != null) {
+            LOG.info("[ScenarioContext] CLEAR thread={}({}) ctxId={} reason={}",
+                    Thread.currentThread().getName(), Thread.currentThread().getId(),
+                    System.identityHashCode(ctx), reason);
+            CTX.remove();
+        }
+    }
+
+    /**
+     * Peek without initializing (diagnostics).
+     */
+    public static ValidationContext peek() {
+        return CTX.get();
+    }
+}
