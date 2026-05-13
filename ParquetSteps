@@ -1,0 +1,440 @@
+package com.fiserv.fef.stepdefs;
+
+import com.fiserv.fef.gherkin.SimpleDataTable;
+import com.fiserv.fef.gherkin.ValidationContext;
+import com.fiserv.fef.gherkin.annotations.And;
+import com.fiserv.fef.gherkin.annotations.Given;
+import com.fiserv.fef.gherkin.annotations.Then;
+import com.fiserv.fef.gherkin.annotations.When;
+import com.fiserv.fef.hadoop.HadoopClientManager;
+import com.fiserv.fef.models.Dataset;
+import com.fiserv.fef.parquet.ProjectedAvroParquetReader;
+import com.fiserv.fef.utils.PropertiesUtil;
+import com.fiserv.fef.utils.Timing;
+import org.apache.parquet.schema.MessageType;
+import org.bson.Document;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.*;
+
+/**
+ * ParquetSteps
+ *
+ * Updates in this version:
+ *  - Supports empty output fields ("") for structural validations
+ *  - Computes TOTAL row count using AdaptiveParquetRowCount (metadata -> fallback scan) independent of maxMatches
+ *  - Stores <context>_schema and <context>_count / <context>_count_source in ValidationContext
+ *  - Keeps existing data-validation logic (UpdatedValue) gated by schema_only_validation flag (Option A)
+ */
+public class ParquetSteps {
+
+    private static final Logger LOG = LoggerFactory.getLogger(ParquetSteps.class);
+    private static final String CTX_HADOOP = "__HADOOP_CTX__";
+
+    /* -----------------------------------------
+     * Hadoop context reuse
+     * ----------------------------------------- */
+    private static HadoopClientManager.HadoopClientContext getOrCreateHadoopCtx(
+            ValidationContext ctx, String fsDefault) {
+        Object existing = ctx.getVariable(CTX_HADOOP);
+        if (existing instanceof HadoopClientManager.HadoopClientContext h) {
+            return h;
+        }
+        try {
+            HadoopClientManager.HadoopClientContext created = HadoopClientManager.acquire(fsDefault);
+            ctx.setVariable(CTX_HADOOP, created);
+            return created;
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to acquire HadoopClientContext", e);
+        }
+    }
+
+    /* ============================================================
+     * READ PARQUET WITHOUT FILTERS ("" supported)
+     * ============================================================ */
+    @Given("I read {string} from {string} parquet file as {string} data")
+    public void readParquetFileWithoutFilters(
+            String fieldNames,
+            String fileName,
+            String contextName) {
+
+        readParquetFileAsColumnarWithFilters(fieldNames, fileName, contextName, null);
+    }
+
+    /* -----------------------------------------
+     * PARQUET READ (supports filters + join keys)
+     * ----------------------------------------- */
+    @Given("I read {string} from {string} parquet file as {string} data filtered by:")
+    public void readParquetFileAsColumnarWithFilters(
+            String fieldNames,
+            String fileName,
+            String contextName,
+            SimpleDataTable dataTable) {
+
+        ValidationContext context = ValidationContext.getCurrent();
+
+        String fsDefault = PropertiesUtil.getInstance().getProperty("fs.defaultFS", "file:///");
+        HadoopClientManager.HadoopClientContext hCtx = getOrCreateHadoopCtx(context, fsDefault);
+
+        long tTotal = Timing.start();
+
+        try {
+            // Resolve file
+            String hdfsFilePath = PropertiesUtil.getInstance().getProperty("hdfs.file.path", "/user/wvc-sparkdev/data/");
+            String fullFileName = fileName.endsWith(".parquet") ? fileName : fileName + ".parquet";
+            if (fsDefault.startsWith("hdfs://")) {
+                fullFileName = hdfsFilePath + fullFileName;
+            }
+
+            // Parse filters + derive join keys (only when a filter table is provided)
+            Map<String, String> filterMap = null;
+            List<String> joinKeys = List.of();
+            if (dataTable != null) {
+                FilterTableParser.ParseResult parsed = FilterTableParser.parse(dataTable);
+                joinKeys = parsed.joinKeys;
+                // Convert filter string to map
+                if (parsed.filterString != null && !parsed.filterString.isBlank()) {
+                    filterMap = new LinkedHashMap<>();
+                    for (String pair : parsed.filterString.split(",")) {
+                        String[] kv = pair.trim().split(":", 2);
+                        if (kv.length == 2 && !kv[0].isBlank()) {
+                            filterMap.put(kv[0].trim(), kv[1].trim());
+                        }
+                    }
+                }
+            }
+
+            // Ensure join keys are included in the output field list for proper keyed comparison
+            String effectiveFieldNames = fieldNames;
+            if (!joinKeys.isEmpty() && effectiveFieldNames != null && !effectiveFieldNames.trim().isEmpty()) {
+                Set<String> requestedFields = new LinkedHashSet<>(
+                        Arrays.stream(effectiveFieldNames.split(","))
+                                .map(String::trim)
+                                .filter(s -> !s.isEmpty())
+                                .toList());
+                for (String jk : joinKeys) {
+                    if (!requestedFields.contains(jk)) {
+                        requestedFields.add(jk);
+                    }
+                }
+                effectiveFieldNames = String.join(",", requestedFields);
+            }
+
+            int maxMatches = Integer.parseInt(
+                    PropertiesUtil.getInstance().getProperty("parquet.read.max.matches", "2147483647"));
+            if (maxMatches <= 0) maxMatches = Integer.MAX_VALUE;
+
+            // Use ProjectedAvroParquetReader for high-performance columnar reading
+            ProjectedAvroParquetReader projectedReader = new ProjectedAvroParquetReader(hCtx);
+            ProjectedAvroParquetReader.ReadResult readResult =
+                    projectedReader.readProjected(fullFileName, effectiveFieldNames, filterMap, maxMatches);
+
+            List<Map<String, Object>> rows = readResult.rows;
+            MessageType schema = readResult.fullSchema;
+
+            // Store schema (for schema-only validation)
+            if (schema != null) {
+                context.setVariable(contextName + "_schema", schema);
+            }
+
+            // Store TOTAL row count from metadata (no extra scan needed)
+            context.setVariable(contextName + "_count", readResult.totalRowCount);
+            context.setVariable(contextName + "_count_source", "METADATA");
+            Timing.log(LOG, "rowCount(METADATA)", tTotal);
+
+            // Persist context
+            context.setVariable(contextName + "_rows", rows);
+            context.setVariable(contextName + "_joinKeys", joinKeys);
+            context.setVariable(contextName + "_file", fullFileName);
+            context.setVariable(contextName + "_filters", filterMap != null ? filterMap.toString() : null);
+
+            // Output fields list (for columnar view)
+            List<String> outFields;
+            if (fieldNames == null || fieldNames.trim().isEmpty()) {
+                outFields = rows.isEmpty() ? List.of() : new ArrayList<>(rows.get(0).keySet());
+            } else {
+                outFields = Arrays.stream(fieldNames.split(","))
+                        .map(String::trim)
+                        .filter(s -> !s.isEmpty())
+                        .toList();
+            }
+
+            // Columnar view
+            Map<String, List<Object>> columnar = new LinkedHashMap<>();
+            for (String f : outFields) columnar.put(f, new ArrayList<>());
+            for (Map<String, Object> r : rows) {
+                for (String f : outFields) {
+                    columnar.get(f).add(r.get(f));
+                }
+            }
+            context.setVariable(contextName + "_columnar", columnar);
+
+            // Dataset (matched rows only) - useful for data validation flows
+            List<Document> docs = new ArrayList<>();
+            for (Map<String, Object> r : rows) docs.add(new Document(r));
+            Dataset dataset = new Dataset();
+            dataset.setDocuments(docs);
+            context.setDataset(contextName, dataset);
+
+            // Matched-row count kept separately if needed
+            context.setVariable(contextName + "_matched_count", dataset.size());
+            context.setVariable(contextName + "_fields", outFields);
+
+            LOG.info(
+                    "[ParquetRead] context={} file={} matchedRows={} joinKeys={} totalRows={} (METADATA), schemaCaptured={}, readTimeMs={}",
+                    contextName, fullFileName, rows.size(), joinKeys,
+                    readResult.totalRowCount, schema != null, readResult.readTimeMs
+            );
+
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to read Parquet file", e);
+        } finally {
+            Timing.log(LOG, "ParquetRead(total)", tTotal);
+        }
+    }
+
+    /* -----------------------------------------
+     * ALL OTHER FIELDS UNCHANGED FLAG
+     * ----------------------------------------- */
+    @And("all other fields must remain unchanged")
+    public void allOtherFieldsMustRemainUnchanged() {
+        ValidationContext.getCurrent().setVariable("validate_all_other_fields_unchanged", true);
+    }
+
+    /* -----------------------------------------
+     * UPDATED VALUE CHECK (multi-row + join keyed)
+     * ----------------------------------------- */
+    @When("I perform {string} check on source and target columnar data for below fields:")
+    public void performUpdatedValueCheckOnSourceAndTargetColumnarDataForBelowFields(
+            String checkType,
+            SimpleDataTable fieldsTable) {
+
+        ValidationContext ctx = ValidationContext.getCurrent();
+
+        // Option A guard: schema-only scenarios should not run data validations
+        if (Boolean.TRUE.equals(ctx.getVariable("schema_only_validation"))) {
+            throw new UnsupportedOperationException(
+                    "UpdatedValue check is not allowed in schema-only validation mode. " +
+                            "Use data-validation scenarios instead."
+            );
+        }
+
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> sourceRows =
+                (List<Map<String, Object>>) ctx.getVariable("source_rows");
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> targetRows =
+                (List<Map<String, Object>>) ctx.getVariable("target_rows");
+
+        if (sourceRows == null || targetRows == null) {
+            throw new IllegalStateException(
+                    "source_rows / target_rows not present. Ensure parquet read steps ran.");
+        }
+
+        if (sourceRows.isEmpty() || targetRows.isEmpty()) {
+            throw new AssertionError(
+                    checkType + " validation FAILED: " +
+                    "source_rows=" + sourceRows.size() + ", target_rows=" + targetRows.size() +
+                    ". No records to compare (check your filter criteria).");
+        }
+
+        boolean validateAllOtherUnchanged =
+                Boolean.TRUE.equals(ctx.getVariable("validate_all_other_fields_unchanged"));
+
+        // Explicit expectations
+        Map<String, Boolean> expectedUpdate = new LinkedHashMap<>();
+        for (Map<String, String> cfg : fieldsTable.asMaps(String.class, String.class)) {
+            String field = cfg.get("fieldName");
+            String upd = cfg.get("Updated");
+            if (field == null || upd == null) continue;
+            if ("REMAINING".equalsIgnoreCase(field.trim()) && !Boolean.parseBoolean(upd)) {
+                validateAllOtherUnchanged = true;
+                continue;
+            }
+            expectedUpdate.put(field.trim(), Boolean.parseBoolean(upd));
+        }
+
+        // Join keys from read-step (filters)
+        @SuppressWarnings("unchecked")
+        List<String> joinKeys = (List<String>) ctx.getVariable("source_joinKeys");
+        if (joinKeys == null) joinKeys = List.of();
+
+        long tIndex = Timing.start();
+        IndexResult srcIndex = indexRows(sourceRows, joinKeys, "SRC");
+        IndexResult tgtIndex = indexRows(targetRows, joinKeys, "TGT");
+        Timing.log(LOG, "JoinIndex(total)", tIndex);
+
+        LOG.info(
+                "[{}] JoinKeys={} SRC(rows={}, uniqueKeys={}, dupKeys={}) TGT(rows={}, uniqueKeys={}, dupKeys={})",
+                checkType,
+                joinKeys,
+                sourceRows.size(), srcIndex.byKey.size(), srcIndex.duplicateKeyCount,
+                targetRows.size(), tgtIndex.byKey.size(), tgtIndex.duplicateKeyCount);
+
+        long tCompare = Timing.start();
+
+        Set<String> allKeys = new TreeSet<>();
+        allKeys.addAll(srcIndex.byKey.keySet());
+        allKeys.addAll(tgtIndex.byKey.keySet());
+
+        List<String> failures = new ArrayList<>();
+
+        for (String key : allKeys) {
+            Map<String, Object> s = srcIndex.byKey.get(key);
+            Map<String, Object> t = tgtIndex.byKey.get(key);
+
+            if (s == null) {
+                failures.add("Missing SOURCE record for key=" + key);
+                continue;
+            }
+            if (t == null) {
+                failures.add("Missing TARGET record for key=" + key);
+                continue;
+            }
+
+            // Explicit fields
+            for (Map.Entry<String, Boolean> e : expectedUpdate.entrySet()) {
+                String f = e.getKey();
+                boolean expected = e.getValue();
+                String sv = toStr(s.get(f));
+                String tv = toStr(t.get(f));
+                boolean isUpdated = isUpdated(sv, tv);
+
+                if (expected != isUpdated) {
+                    failures.add(String.format(
+                            "key=%s field=%s expected=%s actual=%s source='%s' target='%s'",
+                            key, f,
+                            expected ? "UPDATED" : "UNCHANGED",
+                            isUpdated ? "UPDATED" : "UNCHANGED",
+                            sv, tv));
+                }
+            }
+
+            // Remaining fields unchanged
+            if (validateAllOtherUnchanged) {
+                Set<String> rem = new HashSet<>(s.keySet());
+                rem.addAll(t.keySet());
+                rem.removeAll(expectedUpdate.keySet());
+
+                for (String f : rem) {
+                    String sv = toStr(s.get(f));
+                    String tv = toStr(t.get(f));
+                    if (isUpdated(sv, tv)) {
+                        failures.add(String.format(
+                                "key=%s field=%s expected=UNCHANGED actual=UPDATED source='%s' target='%s'",
+                                key, f, sv, tv));
+                    }
+                }
+            }
+        }
+
+        Timing.log(LOG, "JoinCompare(total)", tCompare);
+
+        if (!failures.isEmpty()) {
+            StringBuilder sb = new StringBuilder(2048);
+            sb.append(checkType).append(" validation FAILED\n\n");
+            sb.append("joinKeys=").append(joinKeys).append("\n");
+            sb.append("failures=").append(failures.size()).append("\n\n");
+            failures.forEach(f -> sb.append("  - ").append(f).append("\n"));
+            throw new AssertionError(sb.toString());
+        }
+
+        LOG.info("[{}] validation PASSED for {} rows", checkType, allKeys.size());
+    }
+
+    /* -----------------------------------------
+     * TOTAL ROW COUNT CHECK (structural)
+     * ----------------------------------------- */
+    @Then("source and target parquet record count should match")
+    public void validateRecordCount() {
+
+        ValidationContext ctx = ValidationContext.getCurrent();
+
+        Number src = (Number) ctx.getVariable("source_count");
+        Number tgt = (Number) ctx.getVariable("target_count");
+
+        if (src == null || tgt == null) {
+            throw new IllegalStateException(
+                    "Row count not available. Ensure parquet read steps ran and stored <context>_count."
+            );
+        }
+
+        long srcCount = src.longValue();
+        long tgtCount = tgt.longValue();
+
+        if (srcCount != tgtCount) {
+            throw new AssertionError(
+                    "Parquet row count mismatch:\n" +
+                            "  source_rows = " + srcCount + "\n" +
+                            "  target_rows = " + tgtCount
+            );
+        }
+
+        String srcHow = Objects.toString(ctx.getVariable("source_count_source"), "?");
+        String tgtHow = Objects.toString(ctx.getVariable("target_count_source"), "?");
+
+        // Success visibility
+        ctx.setVariable(
+                "structural_row_count_result",
+                "Row count match source=" + srcCount + " (" + srcHow + "), target=" + tgtCount + " (" + tgtHow + ")"
+        );
+
+        LOG.info("[RowCount] match source={} ({}) target={} ({})", srcCount, srcHow, tgtCount, tgtHow);
+    }
+
+    /* -----------------------------------------
+     * Helpers
+     * ----------------------------------------- */
+    private static final class IndexResult {
+        final Map<String, Map<String, Object>> byKey;
+        final int duplicateKeyCount;
+
+        IndexResult(Map<String, Map<String, Object>> byKey, int dup) {
+            this.byKey = byKey;
+            this.duplicateKeyCount = dup;
+        }
+    }
+
+    private static IndexResult indexRows(
+            List<Map<String, Object>> rows,
+            List<String> joinKeys,
+            String prefix) {
+
+        Map<String, Map<String, Object>> map = new LinkedHashMap<>();
+        Map<String, Integer> seen = new HashMap<>();
+        int dup = 0;
+
+        for (int i = 0; i < rows.size(); i++) {
+            Map<String, Object> r = rows.get(i);
+            String baseKey;
+
+            if (joinKeys.isEmpty()) {
+                baseKey = prefix + "#" + i;
+            } else {
+                baseKey = String.join("|",
+                        joinKeys.stream()
+                                .map(k -> Objects.toString(r.get(k), "NULL"))
+                                .toList());
+            }
+
+            int occ = seen.getOrDefault(baseKey, 0);
+            seen.put(baseKey, occ + 1);
+            String key = occ == 0 ? baseKey : baseKey + "#" + occ;
+            if (occ > 0) dup++;
+
+            map.put(key, r);
+        }
+
+        return new IndexResult(map, dup);
+    }
+
+    private static boolean isUpdated(String s, String t) {
+        if (t == null) return false;
+        return s == null || !s.equals(t);
+    }
+
+    private static String toStr(Object o) {
+        return o == null ? null : o.toString();
+    }
+}
