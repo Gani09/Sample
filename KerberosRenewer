@@ -1,0 +1,84 @@
+package com.fiserv.fef.hadoop;
+
+import org.apache.hadoop.security.UserGroupInformation;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * Kerberos TGT auto-renewal service.
+ *
+ * Uses Hadoop UGI to check ticket expiry and renew
+ * before expiration. Safe to run in OpenShift and
+ * long-running JVMs (Flink, batch jobs).
+ */
+public final class KerberosRenewer {
+
+    private static final Logger LOGGER =
+            LoggerFactory.getLogger(KerberosRenewer.class);
+
+    /**
+     * Single JVM-wide scheduler
+     */
+    private static volatile ScheduledExecutorService scheduler;
+
+    /**
+     * Renewal interval (minutes).
+     * Hadoop decides internally whether renewal is required.
+     */
+    private static final long RENEW_INTERVAL_MINUTES = 10;
+
+    private KerberosRenewer() {
+        /* utility class */
+    }
+
+    /**
+     * Starts Kerberos auto-renewal.
+     * Safe to call multiple times (idempotent).
+     */
+    public static synchronized void start() {
+
+        if (scheduler != null) {
+            return; // already started
+        }
+
+        scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "kerberos-tgt-renewer");
+            t.setDaemon(true);
+            return t;
+        });
+
+        scheduler.scheduleAtFixedRate(() -> {
+                    try {
+                        UserGroupInformation ugi = UserGroupInformation.getLoginUser();
+                        ugi.checkTGTAndReloginFromKeytab();
+                        LOGGER.debug("Kerberos TGT checked/renewed if required for user: {}", ugi.getUserName());
+                    } catch (Exception e) {
+                        LOGGER.error("Kerberos TGT renewal failed", e);
+                    }
+                }, RENEW_INTERVAL_MINUTES,
+                RENEW_INTERVAL_MINUTES,
+                TimeUnit.MINUTES);
+
+        try {
+            UserGroupInformation ugi = UserGroupInformation.getLoginUser();
+            LOGGER.info("Kerberos TGT auto-renewal started (interval={} min) for user: {}", RENEW_INTERVAL_MINUTES, ugi.getUserName());
+        } catch (Exception e) {
+            LOGGER.info("Kerberos TGT auto-renewal started (interval={} min), but failed to get user name: {}", RENEW_INTERVAL_MINUTES, e.getMessage());
+        }
+    }
+
+    /**
+     * Optional: stop renewal on JVM shutdown
+     */
+    public static synchronized void stop() {
+        if (scheduler != null) {
+            scheduler.shutdownNow();
+            scheduler = null;
+            LOGGER.info("Kerberos TGT auto-renewal stopped");
+        }
+    }
+}
