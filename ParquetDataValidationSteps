@@ -1,0 +1,131 @@
+package com.fiserv.fef.stepdefs;
+
+import com.fiserv.fef.gherkin.SimpleDataTable;
+import com.fiserv.fef.gherkin.annotations.Given;
+import com.fiserv.fef.gherkin.annotations.When;
+import com.fiserv.fef.parquet.validation.ParquetReadSpec;
+import com.fiserv.fef.parquet.filter.FilterCondition;
+import com.fiserv.fef.parquet.filter.FilterParser;
+import com.fiserv.fef.parquet.service.ParquetService;
+import com.fiserv.fef.parquet.util.FieldParser;
+import com.fiserv.fef.parquet.validation.ScenarioContextHolder;
+import com.fiserv.fef.parquet.validation.ValidationContext;
+import com.fiserv.fef.utils.Timing;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+public class ParquetDataValidationSteps {
+    private static final Logger LOG = LoggerFactory.getLogger(ParquetDataValidationSteps.class);
+    private final ParquetService parquetService = new ParquetService();
+
+    @Given("I read {string} from {string} parquet file as {string}")
+    public void readParquet(String fields, String path, String role) {
+        long t = Timing.start();
+        try {
+            ValidationContext ctx = ScenarioContextHolder.getOrInit();
+            ParquetReadSpec spec = ParquetReadSpec.builder()
+                    .path(path)
+                    .selectedFields(FieldParser.parse(fields))
+                    .build();
+            if ("source".equalsIgnoreCase(role)) ctx.setSource(spec);
+            else ctx.setTarget(spec);
+        } finally {
+            Timing.log(LOG, "readParquet", t);
+        }
+    }
+
+    @Given("data filtered by:")
+    public void dataFilteredBy(SimpleDataTable table) {
+        long t = Timing.start();
+        try {
+            ValidationContext ctx = ScenarioContextHolder.getOrInit();
+            List<FilterCondition> filters = FilterParser.parse(table);
+            ctx.addFilters(filters);
+        } finally {
+            Timing.log(LOG, "dataFilteredBy", t);
+        }
+    }
+
+    @When("I perform {string} check on source and target columnar data for below fields:")
+    public void performValidation(String type, SimpleDataTable table) {
+        long t = Timing.start();
+        try {
+            Map<String, Boolean> expected = table.asMaps(String.class, String.class)
+                    .stream()
+                    .collect(Collectors.toMap(
+                            m -> m.get("fieldName"),
+                            m -> Boolean.parseBoolean(m.get("Updated"))));
+
+            ValidationContext ctx = ScenarioContextHolder.getOrInit();
+            parquetService.validateUpdatedValues(ctx.getSource(), ctx.getTarget(), ctx.getFilters(), expected);
+        } finally {
+            Timing.log(LOG, "performValidation", t);
+        }
+    }
+
+    @When("I perform {string} check on source and target columnar data")
+    public void performValidationAllFields(String type) {
+        final long t = Timing.start();
+        try {
+            if (!"UpdatedValue".equalsIgnoreCase(type)) {
+                throw new IllegalArgumentException(
+                        "Unsupported validation type: " + type
+                );
+            }
+
+            ValidationContext ctx = ScenarioContextHolder.getOrInit();
+
+            // Ensure join keys are included in the projection for both source and target
+            List<FilterCondition> filters = ctx.getFilters();
+            List<String> joinKeys = filters.stream()
+                    .map(FilterCondition::getKey)
+                    .filter(k -> k != null && !k.isBlank())
+                    .distinct()
+                    .collect(Collectors.toList());
+
+            ParquetReadSpec srcSpec = ctx.getSource();
+            ParquetReadSpec tgtSpec = ctx.getTarget();
+
+            // If selectedFields is ["*"] or empty, add join keys
+            List<String> srcFields = srcSpec.getSelectedFields();
+            List<String> tgtFields = tgtSpec.getSelectedFields();
+
+            boolean srcHasStar = srcFields == null || srcFields.isEmpty() || srcFields.contains("*");
+            boolean tgtHasStar = tgtFields == null || tgtFields.isEmpty() || tgtFields.contains("*");
+
+            if (srcHasStar && !joinKeys.isEmpty()) {
+                srcFields = new java.util.ArrayList<>();
+                srcFields.add("*");
+                srcFields.addAll(joinKeys);
+                srcSpec = ParquetReadSpec.builder()
+                        .path(srcSpec.getPath())
+                        .selectedFields(srcFields)
+                        .build();
+                ctx.setSource(srcSpec);
+            }
+            if (tgtHasStar && !joinKeys.isEmpty()) {
+                tgtFields = new java.util.ArrayList<>();
+                tgtFields.add("*");
+                tgtFields.addAll(joinKeys);
+                tgtSpec = ParquetReadSpec.builder()
+                        .path(tgtSpec.getPath())
+                        .selectedFields(tgtFields)
+                        .build();
+                ctx.setTarget(tgtSpec);
+            }
+
+            parquetService.validateUpdatedValues(
+                    ctx.getSource(),
+                    ctx.getTarget(),
+                    ctx.getFilters(),
+                    null   // null = compare ALL fields
+            );
+        } finally {
+            Timing.log(LOG, "ParquetDataValidationSteps.performValidation(allFields)", t);
+        }
+    }
+}
