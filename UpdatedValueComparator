@@ -1,0 +1,131 @@
+package com.fiserv.fef.parquet.service;
+
+import com.fiserv.fef.parquet.validation.RowData;
+import com.fiserv.fef.parquet.validation.ValidationFailure;
+import org.apache.parquet.io.api.Binary;
+
+import java.math.BigDecimal;
+import java.util.*;
+
+/**
+ * UpdatedValueComparator
+ *
+ * Plan B comparison behavior (final):
+ *  1) If expected map is provided (field -> updated true/false):
+ *     - decide CHANGED/UNCHANGED using schema-derived runtime types
+ *     - emit failures using ValidationFailure factory methods
+ *        * updated=true  AND unchanged => updatedExpectedButUnchanged
+ *        * updated=false AND changed   => notExpectedButChanged
+ *
+ *  2) If expected map is NOT provided (null/empty):
+ *     - compare all projected fields ("*" or explicit list)
+ *     - decide EQUAL/NOT_EQUAL using schema-derived runtime types
+ *     - emit valueMismatch on any NOT_EQUAL
+ *
+ * Schema-derived runtime types note:
+ *  - ParquetGroupValueExtractor already decodes DECIMAL to BigDecimal and BINARY to byte[]
+ *    (and may surface Parquet Binary in some paths). This comparator therefore compares
+ *    using semantic rules for these runtime types.
+ */
+final class UpdatedValueComparator {
+
+    static void compare(String key,
+                        RowData src,
+                        RowData tgt,
+                        Map<String, Boolean> expected,
+                        List<ValidationFailure> out) {
+
+        if (expected == null || expected.isEmpty()) {
+            // Compare all fields available in either row (covers '*' projection and asymmetric maps)
+            Set<String> allFields = new LinkedHashSet<>();
+            if (src != null && src.getAll() != null) allFields.addAll(src.getAll().keySet());
+            if (tgt != null && tgt.getAll() != null) allFields.addAll(tgt.getAll().keySet());
+
+            for (String f : allFields) {
+                Object s = (src == null) ? null : src.get(f);
+                Object t = (tgt == null) ? null : tgt.get(f);
+                if (!valueEquals(s, t)) {
+                    out.add(ValidationFailure.valueMismatch(key, f, s, t));
+                }
+            }
+            return;
+        }
+
+        for (Map.Entry<String, Boolean> e : expected.entrySet()) {
+            String field = e.getKey();
+            Object s = (src == null) ? null : src.get(field);
+            Object t = (tgt == null) ? null : tgt.get(field);
+            boolean changed = !valueEquals(s, t);
+
+            if (Boolean.TRUE.equals(e.getValue()) && !changed) {
+                out.add(ValidationFailure.updatedExpectedButUnchanged(key, field, s, t));
+            }
+            if (Boolean.FALSE.equals(e.getValue()) && changed) {
+                out.add(ValidationFailure.notExpectedButChanged(key, field, s, t));
+            }
+        }
+    }
+
+    private static boolean valueEquals(Object s, Object t) {
+        if (s == t) return true;
+        if (s == null || t == null) return false;
+
+        // Decimal semantic equality: ignore scale differences
+        if (s instanceof BigDecimal || t instanceof BigDecimal) {
+            try {
+                BigDecimal bs = toBigDecimal(s);
+                BigDecimal bt = toBigDecimal(t);
+                return bs.compareTo(bt) == 0;
+            } catch (Exception ignore) {
+                // fall through
+            }
+        }
+
+        // Parquet Binary / byte[] deep equality
+        if (s instanceof byte[] sa && t instanceof byte[] ta) {
+            return Arrays.equals(sa, ta);
+        }
+        if (s instanceof Binary sb && t instanceof Binary tb) {
+            return Arrays.equals(sb.getBytes(), tb.getBytes());
+        }
+        if (s instanceof Binary sb2 && t instanceof byte[] tb2) {
+            return Arrays.equals(sb2.getBytes(), tb2);
+        }
+        if (s instanceof byte[] sa2 && t instanceof Binary tb2) {
+            return Arrays.equals(sa2, tb2.getBytes());
+        }
+
+        // Array handling
+        Class<?> sc = s.getClass();
+        Class<?> tc = t.getClass();
+        if (sc.isArray() && tc.isArray()) {
+            if (s instanceof Object[] so && t instanceof Object[] to) return Arrays.deepEquals(so, to);
+            if (s instanceof int[] so && t instanceof int[] to) return Arrays.equals(so, to);
+            if (s instanceof long[] so && t instanceof long[] to) return Arrays.equals(so, to);
+            if (s instanceof short[] so && t instanceof short[] to) return Arrays.equals(so, to);
+            if (s instanceof byte[] so && t instanceof byte[] to) return Arrays.equals(so, to);
+            if (s instanceof char[] so && t instanceof char[] to) return Arrays.equals(so, to);
+            if (s instanceof boolean[] so && t instanceof boolean[] to) return Arrays.equals(so, to);
+            if (s instanceof float[] so && t instanceof float[] to) return Arrays.equals(so, to);
+            if (s instanceof double[] so && t instanceof double[] to) return Arrays.equals(so, to);
+        }
+
+        // Numeric normalization when both are numbers (defensive)
+        if (s instanceof Number && t instanceof Number) {
+            try {
+                return new BigDecimal(s.toString()).compareTo(new BigDecimal(t.toString())) == 0;
+            } catch (Exception ignore) {
+                // fall through
+            }
+        }
+
+        return Objects.equals(s, t);
+    }
+
+    private static BigDecimal toBigDecimal(Object o) {
+        if (o instanceof BigDecimal bd) return bd;
+        if (o instanceof Number n) return new BigDecimal(n.toString());
+        if (o instanceof CharSequence cs) return new BigDecimal(cs.toString().trim());
+        throw new IllegalArgumentException("Not a decimal: " + o.getClass());
+    }
+}
