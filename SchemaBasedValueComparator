@@ -1,0 +1,34 @@
+package com.fiserv.fef.parquet.validation;
+
+import org.apache.parquet.io.api.Binary;
+import java.math.BigDecimal;
+import java.util.Arrays;
+import java.util.Objects;
+
+/**
+ * Equality-only comparator.
+ * No intent, no failures, no assertions.
+ */
+public final class SchemaBasedValueComparator {
+
+    public boolean isEqual(Object src, Object tgt) {
+        if (src == tgt) return true;
+        if (src == null || tgt == null) return false;
+
+        if (src instanceof BigDecimal || tgt instanceof BigDecimal) {
+            try {
+                return new BigDecimal(src.toString())
+                        .compareTo(new BigDecimal(tgt.toString())) == 0;
+            } catch (Exception ignore) {}
+        }
+
+        if (src instanceof Binary s && tgt instanceof Binary t) {
+            return Arrays.equals(s.getBytes(), t.getBytes());
+        }
+        if (src instanceof byte[] s && tgt instanceof byte[] t) {
+            return Arrays.equals(s, t);
+        }
+
+        return Objects.equals(src, tgt);
+    }
+}
