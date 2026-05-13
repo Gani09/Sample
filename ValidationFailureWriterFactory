@@ -1,0 +1,11 @@
+package com.fiserv.fef.parquet.validation;
+
+public final class ValidationFailureWriterFactory {
+
+    private ValidationFailureWriterFactory() {
+    }
+
+    public static ValidationFailureWriter create() {
+        return new TextValidationFailureWriter();
+    }
+}
