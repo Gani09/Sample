@@ -1,0 +1,31 @@
+package com.fiserv.fef.models;
+
+import java.io.Serializable;
+
+/**
+ * Result of a single step execution
+ */
+public class StepResult implements Serializable {
+    
+    private String stepText;
+    private boolean passed;
+    private String errorMessage;
+    
+    public StepResult() {}
+    
+    public StepResult(String stepText, boolean passed, String errorMessage) {
+        this.stepText = stepText;
+        this.passed = passed;
+        this.errorMessage = errorMessage;
+    }
+    
+    // Getters and Setters
+    public String getStepText() { return stepText; }
+    public void setStepText(String stepText) { this.stepText = stepText; }
+    
+    public boolean isPassed() { return passed; }
+    public void setPassed(boolean passed) { this.passed = passed; }
+    
+    public String getErrorMessage() { return errorMessage; }
+    public void setErrorMessage(String errorMessage) { this.errorMessage = errorMessage; }
+}
