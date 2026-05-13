@@ -1,0 +1,204 @@
+package com.fiserv.fef.datasources;
+
+import com.fiserv.fef.exceptions.DataAccessException;
+import com.fiserv.fef.models.DataQuery;
+import com.fiserv.fef.models.Dataset;
+import com.fiserv.fef.utils.MongoDBClientFactory;
+import com.fiserv.fef.utils.QueryBuilder;
+import com.mongodb.client.MongoCollection;
+import com.mongodb.client.MongoDatabase;
+import com.mongodb.client.MongoClient;
+import org.bson.Document;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.*;
+
+/**
+ * MongoDB data source using aggregation pipeline
+ * Best for: count, distinct, group by operations
+ * Performance: Executes on MongoDB server (push-down)
+ */
+public class MongoAggregationSource implements DataSource {
+
+    private static final Logger LOG = LoggerFactory.getLogger(MongoAggregationSource.class);
+
+    private final MongoDatabase database;
+
+    public MongoAggregationSource() {
+        this.database = MongoDBClientFactory.getDatabase();
+        if (this.database == null) {
+            throw new IllegalStateException("MongoDB database is null. Failed to initialize MongoAggregationSource.");
+        }
+        LOG.debug("MongoAggregationSource initialized with default database");
+    }
+
+    public MongoAggregationSource(MongoDatabase database) {
+        if (database == null) {
+            throw new IllegalArgumentException("MongoDB database cannot be null");
+        }
+        this.database = database;
+        LOG.debug("MongoAggregationSource initialized with custom database");
+    }
+
+    private MongoCollection<Document> tenantCollection(String collectionName) {
+        if (collectionName != null && collectionName.contains(".")) {
+            int dotIndex = collectionName.indexOf('.');
+            String dbName = collectionName.substring(0, dotIndex);
+            String coll   = collectionName.substring(dotIndex + 1);
+            LOG.debug("Tenant collection: switching to database '{}', collection '{}'", dbName, coll);
+            MongoClient client = MongoDBClientFactory.getClient();
+            return client.getDatabase(dbName).getCollection(coll);
+        }
+        return database.getCollection(collectionName);
+    }
+
+
+    @Override
+    public Dataset load(DataQuery query) {
+        LOG.info("Loading data using aggregation: collection={}", query.getCollection());
+
+        try {
+            MongoCollection<Document> collection = tenantCollection(query.getCollection());
+
+
+            // For aggregation source, we typically don't load all documents
+            // Instead, we return aggregated results
+            List<Document> pipeline = buildAggregationPipeline(query);
+            List<Document> results = collection.aggregate(pipeline).into(new ArrayList<>());
+
+            Dataset dataset = new Dataset(query.getCollection());
+            dataset.addAll(results);
+
+            LOG.info("Loaded {} aggregated results", results.size());
+            return dataset;
+
+        } catch (Exception e) {
+            LOG.error("Failed to load data via aggregation: collection={}", query.getCollection(), e);
+            throw new DataAccessException("Failed to load data via aggregation", query.getCollection(),
+                    "aggregate", e);
+        }
+    }
+
+    @Override
+    public long count(DataQuery query) {
+        LOG.info("Counting documents: collection={}", query.getCollection());
+
+        try {
+            MongoCollection<Document> collection = tenantCollection(query.getCollection());
+
+            // Use countDocuments with filter
+            long count = collection.countDocuments(query.getFilter());
+
+            LOG.info("Count result: {} documents", count);
+            return count;
+
+        } catch (Exception e) {
+            LOG.error("Failed to count documents: collection={}", query.getCollection(), e);
+            throw new DataAccessException("Failed to count documents", query.getCollection(), "count", e);
+        }
+    }
+
+    @Override
+    public Set<Object> distinct(String field, DataQuery query) {
+        LOG.info("Getting distinct values: collection={}, field={}", query.getCollection(), field);
+
+        // Log filter details for debugging
+        if (query.getFilter() != null && !query.getFilter().isEmpty()) {
+            LOG.debug("Applying filter: {}", query.getFilter().toJson());
+        } else {
+            LOG.debug("No filter applied - fetching all distinct values");
+        }
+
+        try {
+            MongoCollection<Document> collection = tenantCollection(query.getCollection());
+
+            // Build aggregation pipeline for distinct
+            List<Document> pipeline = QueryBuilder.buildDistinctPipeline(field, query.getFilter());
+
+            // Log pipeline for performance troubleshooting
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("Aggregation pipeline: {}", pipeline);
+            }
+
+            long startTime = System.currentTimeMillis();
+
+            // For better performance with large $in arrays, allow disk use
+            // This prevents MongoDB from running out of memory with large operations
+            List<Document> results = collection.aggregate(pipeline).allowDiskUse(true).into(new ArrayList<>());
+            long duration = System.currentTimeMillis() - startTime;
+
+            Set<Object> distinctValues = new HashSet<>();
+            if (!results.isEmpty()) {
+                List<?> values = results.get(0).getList("values", Object.class);
+                if (values != null) {
+                    distinctValues.addAll(values);
+                }
+            }
+
+            LOG.info("Found {} distinct values in {}ms", distinctValues.size(), duration);
+            return distinctValues;
+
+        } catch (Exception e) {
+            LOG.error("Failed to get distinct values: collection={}, field={}", query.getCollection(), field, e);
+            throw new DataAccessException("Failed to get distinct values", query.getCollection(), "distinct", e);
+
+        }
+    }
+
+    @Override
+    public List<Document> aggregate(String collection, List<Document> pipeline) {
+        LOG.info("Executing aggregation pipeline: collection={}, stages={}", collection, pipeline.size());
+
+        try {
+            MongoCollection<Document> coll = tenantCollection(collection);
+            List<Document> results = coll.aggregate(pipeline).into(new ArrayList<>());
+
+            LOG.info("Aggregation completed: {} results", results.size());
+            return results;
+
+        } catch (Exception e) {
+            LOG.error("Failed to execute aggregation: collection={}", collection, e);
+            throw new DataAccessException("Failed to execute aggregation", collection, "aggregate", e);
+        }
+    }
+
+    @Override
+    public String getSourceType() {
+        return "mongodb_aggregation";
+    }
+
+    /**
+     * Build aggregation pipeline from query
+     */
+    private List<Document> buildAggregationPipeline(DataQuery query) {
+        List<Document> pipeline = new ArrayList<>();
+
+        // Match stage (filter)
+        if (query.getFilter() != null && !query.getFilter().isEmpty()) {
+            pipeline.add(new Document("$match", query.getFilter()));
+        }
+
+        // Project stage (projection)
+        if (query.getProjection() != null && !query.getProjection().isEmpty()) {
+            pipeline.add(new Document("$project", query.getProjection()));
+        }
+
+        // Sort stage
+        if (query.getSort() != null && !query.getSort().isEmpty()) {
+            pipeline.add(new Document("$sort", query.getSort()));
+        }
+
+        // Skip stage
+        if (query.getSkip() != null && query.getSkip() > 0) {
+            pipeline.add(new Document("$skip", query.getSkip()));
+        }
+
+        // Limit stage
+        if (query.getLimit() != null && query.getLimit() > 0) {
+            pipeline.add(new Document("$limit", query.getLimit()));
+        }
+
+        return pipeline;
+    }
+}
