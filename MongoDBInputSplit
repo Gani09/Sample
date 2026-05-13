@@ -1,0 +1,43 @@
+package com.fiserv.fef.datasources;
+
+import org.apache.flink.core.io.InputSplit;
+import org.bson.types.ObjectId;
+
+/**
+ * Input split for MongoDB collections
+ * Represents a range of _id values to be processed by one worker
+ */
+public class MongoDBInputSplit implements InputSplit {
+
+    private final int splitNumber;
+    private final ObjectId startId;
+    private final ObjectId endId;
+
+    public MongoDBInputSplit(int splitNumber, ObjectId startId, ObjectId endId) {
+        this.splitNumber = splitNumber;
+        this.startId = startId;
+        this.endId = endId;
+    }
+
+    @Override
+    public int getSplitNumber() {
+        return splitNumber;
+    }
+
+    public ObjectId getStartId() {
+        return startId;
+    }
+
+    public ObjectId getEndId() {
+        return endId;
+    }
+
+    @Override
+    public String toString() {
+        return "MongoDBInputSplit{" +
+                "split=" + splitNumber +
+                ", start=" + startId +
+                ", end=" + endId +
+                '}';
+    }
+}
