@@ -1,0 +1,62 @@
+package com.fiserv.fef.models;
+
+import java.io.Serializable;
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * Result of a single scenario execution
+ */
+public class ScenarioResult implements Serializable {
+    
+    private String scenarioName;
+    private boolean passed;
+    private List<StepResult> stepResults;
+    private String failureMessage;
+    private long durationMs;
+    // New field to store details object (e.g., source/target counts) regardless of pass/fail
+    private ScenarioDetails details;
+
+    public ScenarioResult() {
+        this.stepResults = new ArrayList<>();
+        this.passed = true;
+    }
+    
+    public ScenarioResult(String scenarioName) {
+        this();
+        this.scenarioName = scenarioName;
+    }
+    
+    // Getters and Setters
+    public String getScenarioName() { return scenarioName; }
+    public void setScenarioName(String scenarioName) { this.scenarioName = scenarioName; }
+    
+    public boolean isPassed() { return passed; }
+    public void setPassed(boolean passed) { this.passed = passed; }
+    
+    public List<StepResult> getStepResults() { return stepResults; }
+    public void setStepResults(List<StepResult> stepResults) { this.stepResults = stepResults; }
+    
+    public String getFailureMessage() { return failureMessage; }
+    public void setFailureMessage(String failureMessage) { this.failureMessage = failureMessage; }
+    
+    public long getDurationMs() { return durationMs; }
+    public void setDurationMs(long durationMs) { this.durationMs = durationMs; }
+
+    // New getter/setter for details
+    public Object getDetails() {
+        return details;
+    }
+
+    public void setDetails(ScenarioDetails details) {
+        this.details = details;
+    }
+
+    public void addStepResult(StepResult result) {
+        this.stepResults.add(result);
+        if (!result.isPassed()) {
+            this.passed = false;
+            this.failureMessage = result.getErrorMessage();
+        }
+    }
+}
