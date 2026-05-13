@@ -1,0 +1,90 @@
+# MongoDB Configuration
+mongodb.uri=mongodb://optisdevuser:Welc0me24@otp-mongodb-msr-omh-dev.1dc.com:27017/?authSource=admin&connectTimeoutMS=600000&tls=false
+# SEP data database (for validation data access)
+mongodb.database=Card_Issuer_Sync
+# FEF collections database (for pipeline, registry, results, features)
+mongodb.fef.database=Optis_fef_config_db
+mongodb.connection.pool.min-size=5
+mongodb.connection.pool.max-size=50
+mongodb.connection.timeout=15000
+mongodb.socket.timeout=60000
+mongodb.server.selection.timeout=30000
+
+# MongoDB Collection Names
+mongodb.collection.pipeline=${MONGODB_COLLECTION_PIPELINE:fef_validation_pipeline}
+mongodb.collection.registry=${MONGODB_COLLECTION_REGISTRY:fef_validation_registry}
+mongodb.collection.results=${MONGODB_COLLECTION_RESULTS:fef_validation_results}
+mongodb.collection.features=${MONGODB_COLLECTION_FEATURES:fef_validation_features}
+mongodb.collection.scores = ${MONGODB_COLLECTION_SCORES:fef_validation_scores}
+
+# Flink Configuration
+flink.parallelism.default=1
+flink.checkpoint.interval=60000
+flink.restart.strategy=fixed-delay
+flink.restart.attempts=999999
+flink.restart.delay=10
+
+# Validation Configuration
+
+# =====================================================
+# SCENARIO PARALLELISM (Level 4 - Java Threads)
+# =====================================================
+# validation.gherkin.scenario.parallelism: Number of scenarios to run in parallel per feature
+# This uses Java ExecutorService with thread pool (NOT Flink parallelism)
+# Each worker job creates its own thread pool for scenario execution
+# Example: Feature file with 4 scenarios + parallelism=4 ? all 4 run concurrently
+#          Feature file with 10 scenarios + parallelism=4 ? 4 at a time, then 4, then 2
+validation.gherkin.scenario.parallelism=4
+
+validation.execution.timeout=600000
+
+# Data Access Configuration
+data.access.strategy.auto=true
+data.access.cursor.batch-size=10000
+data.access.aggregation.enabled=true
+data.access.flink.enabled=true
+
+# Kafka and SSL configurations
+kafka.topics=otp-dev-servicingorder-account-created:AP-NA-cot-kafka-group,otp_dev_sync_servicing_order_day0:AP-NA-cot-kafka-group,otp-dev-producer-audit:optis-eod,otp_dev_sync_servicing_order_day0:AP-NA-cot-kafka-group
+kafka.bootstrapServer=syld2ak1eki0004.1dc.com:9094, syld2ak1eki0005.1dc.com:9094, syld2ak1eki0006.1dc.com:9094, syld2ak1eki0001.1dc.com:9094, syld2ak1eki0002.1dc.com:9094, syld2ak1eki0003.1dc.com:9094
+kafka.ssl.keystore.location=/work/certs/dev-kafka-keystore.jks
+kafka.ssl.truststore.location=/work/certs/dev-kafka-truststore.jks
+kafka.ssl.pwd=${KAFKA_SSL_PWD}
+# MongoDB Sink configuration
+mongo.sink.batch.size=500
+mongo.sink.flush.interval.ms=2000
+mongo.sink.max.retries=2
+mongo.sink.retry.delay.ms=1000
+
+# Switch between local and HDFS HA
+fs.defaultFS=file:///
+#fs.defaultFS=hdfs://Optis-DEV-NSNode
+
+# Turn this off after debugging (recommended)
+kerberos.debug=false
+krb5.conf.path=/work/etc/krb5_commdev.conf.d/krb5_commdev.conf
+kerberos.keytab=/work/etc/krb5_commdev.conf.d/shortname-cloudera.keytab
+kerberos.principal=wvc-sparkdev@COMMDEV.FISERV.ONE
+
+#record.match.anywhere=true to match the filter values anywhere in the record
+#record.match.anywhere=false to match only at the root level(filter key must be a dot-path)
+record.match.anywhere=true
+hdfs.file.path=
+# Debug
+parquet.debug.max.matched.records=10
+# json or text
+validation.output.format=text
+# Cache size (LRU)
+parquet.footer.cache.max=256
+parquet.diff.max.lines=6000
+#AUTO, METADATA, SCAN
+parquet.row.count.mode=AUTO
+
+# Input Parquet
+#parquet.inbound=work/2026-03-26_INBOUND_CHM_CMSTR_NEW_CITI.parquet
+#parquet.inbound=work/CHMASTER_CITI_INBOUND.parquet
+parquet.inbound=work/CHD140.CHMASTER.snappy.parquet
+
+# Filters (supports both nested dot-path and flat top-level)
+parquet.inbound.input.filters=chdAccountNumber:5131460000011079
+parquet.inbound.output.fields=chdCreditLine,chdAccountNumber
