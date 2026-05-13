@@ -1,0 +1,61 @@
+package com.fiserv.fef.datasources;
+
+import com.fiserv.fef.models.DataQuery;
+
+/**
+ * Analyzes queries to determine optimal data access strategy
+ */
+public class QueryAnalyzer {
+    
+    /**
+     * Analyze query and estimate size
+     * @param query Query to analyze
+     * @return Estimated result size
+     */
+    public static long estimateSize(DataQuery query) {
+        // TODO: Implement actual size estimation
+        // For now, return a conservative estimate
+        return 100000L;
+    }
+    
+    /**
+     * Check if query is an aggregation
+     * @param query Query to check
+     * @return true if aggregation operation
+     */
+    public static boolean isAggregation(DataQuery query) {
+        return query.isRequiresAggregation();
+    }
+    
+    /**
+     * Check if query requires join
+     * @param query Query to check
+     * @return true if join required
+     */
+    public static boolean requiresJoin(DataQuery query) {
+        return query.isRequiresJoin();
+    }
+    
+    /**
+     * Determine optimal strategy for query
+     * @param query Query to analyze
+     * @return Strategy name: aggregation, cursor, flink_dataset
+     */
+    public static String determineStrategy(DataQuery query) {
+        if (isAggregation(query)) {
+            return "aggregation";
+        }
+        
+        long estimatedSize = estimateSize(query);
+        
+        if (estimatedSize < 100000) {
+            return "cursor";
+        } else if (requiresJoin(query)) {
+            return "flink_dataset";
+        } else if (estimatedSize > 1000000) {
+            return "flink_dataset";
+        } else {
+            return "cursor_batch";
+        }
+    }
+}
