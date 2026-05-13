@@ -1,0 +1,420 @@
+package com.fiserv.fef.parquet.distributed;
+
+import com.fiserv.fef.hadoop.HadoopClientManager;
+import com.fiserv.fef.utils.PropertiesUtil;
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.streaming.api.functions.source.RichParallelSourceFunction;
+import org.apache.hadoop.fs.Path;
+import org.apache.parquet.column.page.PageReadStore;
+import org.apache.parquet.hadoop.ParquetFileReader;
+import org.apache.parquet.hadoop.metadata.ParquetMetadata;
+import org.apache.parquet.hadoop.util.HadoopInputFile;
+import org.apache.parquet.io.ColumnIOFactory;
+import org.apache.parquet.io.MessageColumnIO;
+import org.apache.parquet.io.api.Binary;
+import org.apache.parquet.io.api.Converter;
+import org.apache.parquet.io.api.GroupConverter;
+import org.apache.parquet.io.api.PrimitiveConverter;
+import org.apache.parquet.io.api.RecordMaterializer;
+import org.apache.parquet.schema.MessageType;
+import org.apache.parquet.schema.PrimitiveType;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * Row-group-aware parallel Parquet source.
+ *
+ * Uses a CUSTOM streaming converter (HashComputingMaterializer) that computes
+ * the hash INLINE as each field is delivered by Parquet — zero Group object
+ * allocation, zero getFieldRepetitionCount() loops, zero GC pressure.
+ *
+ * Each subtask handles row groups where (rowGroupIndex % parallelism == subtaskIndex).
+ */
+public class ParallelParquetRowGroupSource
+        extends RichParallelSourceFunction<DistributedParquetCompareJob.TaggedRecord> {
+
+    private static final long serialVersionUID = 1L;
+    private static final Logger LOG = LoggerFactory.getLogger(ParallelParquetRowGroupSource.class);
+
+    /** Number of records to accumulate before taking the checkpoint lock once to emit them all. */
+    private static final int COLLECT_BATCH_SIZE = 2000;
+
+    /** Shared metadata cache: first subtask on this JVM reads the file, others reuse it. */
+    private static final ConcurrentHashMap<String, CachedMeta> META_CACHE = new ConcurrentHashMap<>();
+
+    private static final class CachedMeta {
+        final MessageType schema;
+        final int totalRowGroups;
+        CachedMeta(MessageType schema, int totalRowGroups) {
+            this.schema = schema;
+            this.totalRowGroups = totalRowGroups;
+        }
+    }
+
+    private final String filePath;
+    private final String joinKey;
+    private final String side;
+    private volatile boolean running = true;
+
+    public ParallelParquetRowGroupSource(String filePath, String joinKey, String side) {
+        this.filePath = filePath;
+        this.joinKey = joinKey;
+        this.side = side;
+    }
+
+    @Override
+    public void open(Configuration parameters) throws Exception {
+        super.open(parameters);
+    }
+
+    @Override
+    public void run(SourceContext<DistributedParquetCompareJob.TaggedRecord> ctx) throws Exception {
+        int subtaskIndex = getRuntimeContext().getIndexOfThisSubtask();
+        int totalParallelism = getRuntimeContext().getNumberOfParallelSubtasks();
+
+        LOG.info("[{}] Subtask {}/{} starting — file: {}", side, subtaskIndex + 1, totalParallelism, filePath);
+
+        // Use the shared Hadoop/HDFS initialization used across this repo (loads core-site.xml/hdfs-site.xml,
+        // sets fs.defaultFS, and initializes Kerberos when needed). A raw new Configuration() does not
+        // know about the "hdfs" scheme and results in: UnsupportedFileSystemException: No FileSystem for scheme "hdfs".
+        String fsDefault = PropertiesUtil.getInstance().getProperty("fs.defaultFS", "file:///");
+        HadoopClientManager.HadoopClientContext hadoopCtx = HadoopClientManager.acquire(fsDefault);
+        org.apache.hadoop.conf.Configuration hadoopConf = hadoopCtx.conf();
+
+        Path hadoopPath = new Path(filePath);
+
+        MessageType schema;
+        int totalRowGroups;
+        int myRowGroupCount;
+
+        // Use shared metadata cache — first subtask on this JVM reads the file,
+        // subsequent subtasks reuse the cached result (avoids 40 concurrent file opens)
+        CachedMeta cached = META_CACHE.computeIfAbsent(filePath, path -> {
+            try {
+                return hadoopCtx.doAs(() -> {
+                    try (ParquetFileReader mr = ParquetFileReader.open(
+                            HadoopInputFile.fromPath(new Path(path), hadoopConf))) {
+                        ParquetMetadata md = mr.getFooter();
+                        return new CachedMeta(
+                                md.getFileMetaData().getSchema(),
+                                md.getBlocks().size());
+                    }
+                });
+            } catch (Exception e) {
+                throw new RuntimeException("Failed to read Parquet metadata: " + path, e);
+            }
+        });
+        schema = cached.schema;
+        totalRowGroups = cached.totalRowGroups;
+        myRowGroupCount = 0;
+        for (int i = subtaskIndex; i < totalRowGroups; i += totalParallelism) {
+            myRowGroupCount++;
+        }
+
+        LOG.info("[{}] Subtask {}/{} assigned {}/{} row groups",
+                side, subtaskIndex + 1, totalParallelism, myRowGroupCount, totalRowGroups);
+
+        if (myRowGroupCount == 0) {
+            LOG.info("[{}] Subtask {}/{} has no row groups — done.", side, subtaskIndex + 1, totalParallelism);
+            return;
+        }
+
+        // Stagger I/O startup: each subtask waits proportionally to its index.
+        // Prevents all subtasks from hitting the disk simultaneously.
+        // Max stagger = 2 seconds spread across all subtasks (reduced from 10s).
+        long staggerMs = (long) subtaskIndex * (2_000L / Math.max(totalParallelism, 1));
+        if (staggerMs > 0) {
+            LOG.info("[{}] Subtask {}/{} I/O stagger: waiting {}ms before reading",
+                    side, subtaskIndex + 1, totalParallelism, staggerMs);
+            Thread.sleep(staggerMs);
+        }
+
+        // Support dotted path for nested join keys (e.g. "chdBaseSegment.chdFullAcctNo.chdAccountNumber")
+        String[] joinKeyPath = joinKey.contains(".") ? joinKey.split("\\.") : new String[]{joinKey};
+        validateKeyPath(schema, joinKeyPath);
+
+        // Build the streaming materializer ONCE — reused for every record
+        HashComputingMaterializer materializer = new HashComputingMaterializer(schema, joinKeyPath, side);
+        MessageColumnIO columnIO = new ColumnIOFactory().getColumnIO(schema);
+        long totalRead = 0;
+
+        // Pre-allocated batch to amortize checkpoint-lock acquisitions.
+        // Instead of acquiring the lock 100,000 times, we acquire it ~50 times per row group.
+        List<DistributedParquetCompareJob.TaggedRecord> batch = new ArrayList<>(COLLECT_BATCH_SIZE);
+
+        try {
+            try (ParquetFileReader reader = hadoopCtx.doAs(() ->
+                    ParquetFileReader.open(HadoopInputFile.fromPath(hadoopPath, hadoopConf)))) {
+
+                for (int blockIdx = 0; blockIdx < totalRowGroups && running; blockIdx++) {
+                    if (blockIdx % totalParallelism != subtaskIndex) {
+                        reader.skipNextRowGroup();
+                        continue;
+                    }
+
+                    PageReadStore pages = reader.readNextRowGroup();
+                    if (pages == null) continue;
+
+                    long rowsInGroup = pages.getRowCount();
+                    org.apache.parquet.io.RecordReader<DistributedParquetCompareJob.TaggedRecord> recordReader =
+                            columnIO.getRecordReader(pages, materializer);
+
+                    LOG.info("[{}] Subtask {}/{} reading row group {} — {} rows",
+                            side, subtaskIndex + 1, totalParallelism, blockIdx, rowsInGroup);
+
+                    for (long r = 0; r < rowsInGroup && running; r++) {
+                        DistributedParquetCompareJob.TaggedRecord record = recordReader.read();
+                        if (record == null) break;
+
+                        batch.add(record);
+                        totalRead++;
+
+                        // Flush batch: acquire the checkpoint lock ONCE per COLLECT_BATCH_SIZE records
+                        // instead of once per record — eliminates ~99.95% of lock acquisitions.
+                        if (batch.size() >= COLLECT_BATCH_SIZE) {
+                            synchronized (ctx.getCheckpointLock()) {
+                                for (DistributedParquetCompareJob.TaggedRecord rec : batch) {
+                                    ctx.collect(rec);
+                                }
+                            }
+                            batch.clear();
+                        }
+
+                        if (totalRead % 10_000 == 0) {
+                            LOG.info("[{}] Subtask {}/{} progress: {}/{} records",
+                                    side, subtaskIndex + 1, totalParallelism, totalRead, rowsInGroup);
+                        }
+                    }
+
+                    // Flush remaining records in the batch at end of row group
+                    if (!batch.isEmpty()) {
+                        synchronized (ctx.getCheckpointLock()) {
+                            for (DistributedParquetCompareJob.TaggedRecord rec : batch) {
+                                ctx.collect(rec);
+                            }
+                        }
+                        batch.clear();
+                    }
+
+                    LOG.info("[{}] Subtask {}/{} finished row group {} — {} records so far",
+                            side, subtaskIndex + 1, totalParallelism, blockIdx, totalRead);
+                }
+            }
+
+            LOG.info("[{}] ✅ Subtask {}/{} completed — total: {}",
+                    side, subtaskIndex + 1, totalParallelism, totalRead);
+        } finally {
+            // ParquetFileReader is scoped to this source, but Hadoop client context is shared/cached.
+            // Release our reference on completion or failure.
+            HadoopClientManager.release();
+        }
+    }
+
+    @Override
+    public void cancel() {
+        running = false;
+    }
+
+    // =========================================================================
+    // Schema path validation
+    // =========================================================================
+
+    /**
+     * Validate that the dotted join key path exists in the schema and resolves to a primitive.
+     * Throws a clear error listing available fields at the failing level.
+     */
+    static void validateKeyPath(MessageType schema, String[] path) {
+        org.apache.parquet.schema.Type current = schema;
+        for (String segment : path) {
+            if (current.isPrimitive()) {
+                throw new IllegalArgumentException(
+                        "Join key path segment '" + segment + "' cannot be navigated — parent '" +
+                        current.getName() + "' is a primitive, not a group.");
+            }
+            org.apache.parquet.schema.GroupType group = current instanceof MessageType
+                    ? (MessageType) current : current.asGroupType();
+            int idx = group.getFieldIndex(segment);
+            if (idx < 0) {
+                String available = group.getFields().stream()
+                        .map(org.apache.parquet.schema.Type::getName)
+                        .collect(java.util.stream.Collectors.joining(", "));
+                throw new IllegalArgumentException(
+                        "Join key path segment '" + segment + "' not found. " +
+                        "Full path: " + String.join(".", path) + ". " +
+                        "Available fields at this level: [" + available + "]. " +
+                        "Use dotted notation for nested fields, e.g. " +
+                        "\"chdBaseSegment.chdFullAcctNo.chdAccountNumber\"");
+            }
+            current = group.getFields().get(idx);
+        }
+        if (!current.isPrimitive()) {
+            throw new IllegalArgumentException(
+                    "Join key path '" + String.join(".", path) + "' resolves to a GROUP, not a primitive. " +
+                    "Extend the path to a leaf primitive field.");
+        }
+    }
+
+    // =========================================================================
+    // Custom streaming materializer — computes hash inline, ZERO Group allocation
+    // =========================================================================
+
+    /**
+     * RecordMaterializer that streams field values directly into a hash computation.
+     * Supports dotted join key paths for nested schemas (e.g. "parent.child.field").
+     * All nested primitive fields contribute to the hash — nothing is discarded.
+     */
+    static final class HashComputingMaterializer
+            extends RecordMaterializer<DistributedParquetCompareJob.TaggedRecord> {
+
+        private final HashComputingRootConverter rootConverter;
+
+        HashComputingMaterializer(MessageType schema, String[] joinKeyPath, String side) {
+            this.rootConverter = new HashComputingRootConverter(schema, joinKeyPath, side);
+        }
+
+        @Override
+        public DistributedParquetCompareJob.TaggedRecord getCurrentRecord() {
+            return rootConverter.buildRecord();
+        }
+
+        @Override
+        public GroupConverter getRootConverter() {
+            return rootConverter;
+        }
+    }
+
+    static final class HashComputingRootConverter extends GroupConverter {
+
+        private final Converter[] converters;
+        private final String side;
+
+        // Mutable state reset per record — no allocation per record
+        int currentHash;
+        String currentKey;
+
+        HashComputingRootConverter(MessageType schema, String[] joinKeyPath, String side) {
+            this.side = side;
+            int fieldCount = schema.getFieldCount();
+            this.converters = new Converter[fieldCount];
+            for (int i = 0; i < fieldCount; i++) {
+                converters[i] = buildFieldConverter(schema.getFields().get(i), this, joinKeyPath, 0);
+            }
+        }
+
+        @Override public Converter getConverter(int fieldIndex) { return converters[fieldIndex]; }
+
+        @Override
+        public void start() {
+            currentHash = 1;
+            currentKey = "NULL";
+        }
+
+        @Override public void end() {}
+
+        DistributedParquetCompareJob.TaggedRecord buildRecord() {
+            byte[] hashBytes = new byte[]{
+                    (byte)(currentHash >>> 24),
+                    (byte)(currentHash >>> 16),
+                    (byte)(currentHash >>> 8),
+                    (byte) currentHash
+            };
+            return new DistributedParquetCompareJob.TaggedRecord(currentKey, hashBytes, side);
+        }
+    }
+
+    /**
+     * Build the right converter for a schema field, navigating the join key path.
+     *
+     * @param field     the schema field to build a converter for
+     * @param root      the root converter that holds mutable hash/key state
+     * @param keyPath   the full dotted join key path segments
+     * @param keyDepth  how deep we currently are in the key path (0 = top level)
+     */
+    static Converter buildFieldConverter(
+            org.apache.parquet.schema.Type field,
+            HashComputingRootConverter root,
+            String[] keyPath,
+            int keyDepth) {
+
+        boolean onKeyPath = keyPath != null
+                && keyDepth < keyPath.length
+                && field.getName().equals(keyPath[keyDepth]);
+
+        if (field.isPrimitive()) {
+            // Is this the final key leaf?
+            if (onKeyPath && keyDepth == keyPath.length - 1) {
+                return new KeyCapturingConverter(root);
+            }
+            return new HashingPrimitiveConverter(root,
+                    field.asPrimitiveType().getPrimitiveTypeName());
+        } else {
+            // Group field — recurse; pass key path only if we're still on the key path
+            org.apache.parquet.schema.GroupType groupType = field.asGroupType();
+            String[] subPath = onKeyPath ? keyPath : null;
+            int subDepth = onKeyPath ? keyDepth + 1 : 0;
+            return new HashingGroupConverter(groupType, root, subPath, subDepth);
+        }
+    }
+
+    /**
+     * Recursively hashes all nested primitive fields AND navigates to the join key leaf.
+     * Replaces the old NoOpGroupConverter which was silently discarding all nested values.
+     */
+    static final class HashingGroupConverter extends GroupConverter {
+        private final Converter[] converters;
+
+        HashingGroupConverter(org.apache.parquet.schema.GroupType groupType,
+                              HashComputingRootConverter root,
+                              String[] keyPath, int keyDepth) {
+            int n = groupType.getFieldCount();
+            converters = new Converter[n];
+            for (int i = 0; i < n; i++) {
+                converters[i] = buildFieldConverter(groupType.getFields().get(i), root, keyPath, keyDepth);
+            }
+        }
+
+        @Override public Converter getConverter(int i) { return converters[i]; }
+        @Override public void start() {}
+        @Override public void end() {}
+    }
+
+    /** Captures the join key field value as a String. */
+    static final class KeyCapturingConverter extends PrimitiveConverter {
+        private final HashComputingRootConverter parent;
+
+        KeyCapturingConverter(HashComputingRootConverter parent) {
+            this.parent = parent;
+        }
+
+        @Override public void addBinary(Binary value)  { parent.currentKey = value.toStringUsingUTF8(); }
+        @Override public void addInt(int value)        { parent.currentKey = Integer.toString(value); }
+        @Override public void addLong(long value)      { parent.currentKey = Long.toString(value); }
+        @Override public void addFloat(float value)    { parent.currentKey = Float.toString(value); }
+        @Override public void addDouble(double value)  { parent.currentKey = Double.toString(value); }
+        @Override public void addBoolean(boolean v)    { parent.currentKey = Boolean.toString(v); }
+    }
+
+    /** Updates the running hash directly from the primitive value — no String, no allocation. */
+    static final class HashingPrimitiveConverter extends PrimitiveConverter {
+        private final HashComputingRootConverter parent;
+        @SuppressWarnings("unused")
+        private final PrimitiveType.PrimitiveTypeName typeName;
+
+        HashingPrimitiveConverter(HashComputingRootConverter parent,
+                                   PrimitiveType.PrimitiveTypeName typeName) {
+            this.parent = parent;
+            this.typeName = typeName;
+        }
+
+        @Override public void addInt(int value)        { parent.currentHash = 31 * parent.currentHash + value; }
+        @Override public void addLong(long value)      { parent.currentHash = 31 * parent.currentHash + Long.hashCode(value); }
+        @Override public void addFloat(float value)    { parent.currentHash = 31 * parent.currentHash + Float.floatToIntBits(value); }
+        @Override public void addDouble(double value)  { parent.currentHash = 31 * parent.currentHash + Long.hashCode(Double.doubleToLongBits(value)); }
+        @Override public void addBoolean(boolean value){ parent.currentHash = 31 * parent.currentHash + (value ? 1231 : 1237); }
+        @Override public void addBinary(Binary value)  { parent.currentHash = 31 * parent.currentHash + value.hashCode(); }
+    }
+}
