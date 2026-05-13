@@ -1,0 +1,135 @@
+package com.fiserv.fef.parquet.filter;
+
+import com.fiserv.fef.utils.PropertiesUtil;
+import com.fiserv.fef.utils.Timing;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FileStatus;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
+import org.apache.parquet.format.converter.ParquetMetadataConverter;
+import org.apache.parquet.hadoop.ParquetFileReader;
+import org.apache.parquet.hadoop.metadata.ParquetMetadata;
+import org.apache.parquet.schema.MessageType;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+/** Footer (metadata) cache keyed by (path,size,mtime). */
+public final class ParquetFooterCache {
+    private static final Logger LOG = LoggerFactory.getLogger(ParquetFooterCache.class);
+
+    private static final int MAX_ENTRIES = Integer.parseInt(
+            PropertiesUtil.getInstance().getProperty("parquet.footer.cache.max", "256")
+    );
+
+    private static final boolean LOG_SCHEMA_ON_HIT = Boolean.parseBoolean(
+            PropertiesUtil.getInstance().getProperty("parquet.schema.log.on.hit", "false")
+    );
+
+    private static final Map<String, ParquetMetadata> CACHE = Collections.synchronizedMap(
+            new LinkedHashMap<>(256, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, ParquetMetadata> eldest) {
+                    return size() > MAX_ENTRIES;
+                }
+            }
+    );
+
+    private static final DateTimeFormatter TS_FMT =
+            DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS").withZone(ZoneId.systemDefault());
+
+    private ParquetFooterCache() {}
+
+    public static ParquetMetadata readFooterCached(Configuration conf, FileSystem fs, Path path) throws Exception {
+        long t0 = Timing.start();
+        FileStatus st = fs.getFileStatus(path);
+        long size = st.getLen();
+        long mtime = st.getModificationTime();
+        String key = path + "\n" + size + "\n" + mtime;
+
+        ParquetMetadata cached = CACHE.get(key);
+        if (cached != null) {
+            if (LOG.isDebugEnabled()) {
+                logHit(path, size, mtime, cached);
+                Timing.debug(LOG, "ParquetFooterCache.readFooterCached", t0);
+            }
+            return cached;
+        }
+
+        if (LOG.isDebugEnabled()) {
+            logMiss(path, size, mtime);
+        }
+
+        ParquetMetadata md = ParquetFileReader.readFooter(conf, path, ParquetMetadataConverter.NO_FILTER);
+        CACHE.put(key, md);
+
+        if (LOG.isDebugEnabled()) {
+            logStored(path, size, mtime, md);
+            Timing.debug(LOG, "ParquetFooterCache.readFooterCached", t0);
+        }
+
+        return md;
+    }
+
+    private static void logHit(Path path, long size, long mtime, ParquetMetadata md) {
+        MessageType schema = md.getFileMetaData().getSchema();
+        String fp = schemaFingerprint(schema);
+        LOG.debug(
+                "ParquetFooterCache HIT path={} size={} mtime={} ({}) fields={} fingerprint={} cacheSize={}",
+                path, size, mtime, humanTime(mtime), schema.getFieldCount(), fp, CACHE.size()
+        );
+        if (LOG_SCHEMA_ON_HIT) {
+            LOG.debug("Parquet schema (CACHE HIT) for path={}:\n{}", path, schema);
+        }
+    }
+
+    private static void logMiss(Path path, long size, long mtime) {
+        LOG.debug(
+                "ParquetFooterCache MISS path={} size={} mtime={} ({}) cacheSize={}",
+                path, size, mtime, humanTime(mtime), CACHE.size()
+        );
+    }
+
+    private static void logStored(Path path, long size, long mtime, ParquetMetadata md) {
+        MessageType schema = md.getFileMetaData().getSchema();
+        String fp = schemaFingerprint(schema);
+        LOG.debug(
+                "ParquetFooterCache STORED path={} size={} mtime={} ({}) fields={} fingerprint={} cacheSize={}",
+                path, size, mtime, humanTime(mtime), schema.getFieldCount(), fp, CACHE.size()
+        );
+        LOG.debug("Parquet schema (CACHE MISS->LOAD) for path={}:\n{}", path, schema);
+    }
+
+    public static String schemaFingerprint(MessageType schema) {
+        if (schema == null) return "<null>";
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            byte[] digest = md.digest(schema.toString().getBytes(StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder(digest.length * 2);
+            for (byte b : digest) sb.append(String.format("%02x", b));
+            return sb.toString();
+        } catch (Exception e) {
+            return "<fingerprint-error>";
+        }
+    }
+
+    private static String humanTime(long epochMillis) {
+        return TS_FMT.format(Instant.ofEpochMilli(epochMillis));
+    }
+
+    public static int size() {
+        return CACHE.size();
+    }
+
+    public static void clear() {
+        CACHE.clear();
+    }
+}
