@@ -1,0 +1,140 @@
+package com.fiserv.fef.models;
+
+import java.io.Serializable;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Configuration for a single validation (loaded from MongoDB)
+ */
+public class ValidationConfig implements Serializable {
+    
+    private String processName;
+    private int processStepNumber;
+    
+    // Classification
+    private String executionMode;   // streaming, batch
+    private String trigger;          // on_message, end_of_day, on_completion
+    
+    // Source configuration
+    private String track;
+    private String orchestration;
+    private List<String> serviceDomains;
+    
+    // Data sources
+    private DataSourceConfig sourceDataSource;
+    private List<DataSourceConfig> targetDataSources;
+    
+    // Performance config
+    private PerformanceConfig performanceConfig;
+    
+    // MongoDB document fields
+    private String processID; // processID (for direct mapping)
+    private String validationID;
+    private String featureID;
+    private String valDescription;
+    private String valName;
+    private int step_number;
+    private String created_at;
+    private boolean enabled;
+    private Map<String, Object> execution_profiles;
+    // DB names for multi-tenant routing (from fef_validation_pipeline)
+    private String sourceDbName;
+    private String targetDbName;
+
+    // Gherkin feature ID (for Gherkin-based validations)
+
+    // Gherkin feature ID (for Gherkin-based validations)
+
+    // Distributed parquet comparison config
+    private String distributedJoinKey;
+    private int distributedParallelism;
+    private String distributedExpectedUpdates;
+
+
+    public ValidationConfig() {
+        this.enabled = true;
+    }
+    
+    // Getters and Setters
+    public String getProcessName() { return processName; }
+    public void setProcessName(String processName) { this.processName = processName; }
+    
+    public int getProcessStepNumber() { return processStepNumber; }
+    public void setProcessStepNumber(int processStepNumber) { this.processStepNumber = processStepNumber; }
+    
+    public String getExecutionMode() { return executionMode; }
+    public void setExecutionMode(String executionMode) { this.executionMode = executionMode; }
+    
+    public String getTrigger() { return trigger; }
+    public void setTrigger(String trigger) { this.trigger = trigger; }
+    
+    public String getTrack() { return track; }
+    public void setTrack(String track) { this.track = track; }
+    
+    public String getOrchestration() { return orchestration; }
+    public void setOrchestration(String orchestration) { this.orchestration = orchestration; }
+    
+    public List<String> getServiceDomains() { return serviceDomains; }
+    public void setServiceDomains(List<String> serviceDomains) { this.serviceDomains = serviceDomains; }
+    
+    public DataSourceConfig getSourceDataSource() { return sourceDataSource; }
+    public void setSourceDataSource(DataSourceConfig sourceDataSource) { this.sourceDataSource = sourceDataSource; }
+    
+    public List<DataSourceConfig> getTargetDataSources() { return targetDataSources; }
+    public void setTargetDataSources(List<DataSourceConfig> targetDataSources) { this.targetDataSources = targetDataSources; }
+    
+    public PerformanceConfig getPerformanceConfig() { return performanceConfig; }
+    public void setPerformanceConfig(PerformanceConfig performanceConfig) { this.performanceConfig = performanceConfig; }
+    
+    public String getProcessID() { return processID; }
+    public void setProcessID(String processID) { this.processID = processID; }
+
+    public String getValidationID() { return validationID; }
+    public void setValidationID(String validationID) { this.validationID = validationID; }
+
+    public String getFeatureID() { return featureID; }
+    public void setFeatureID(String featureID) { this.featureID = featureID; }
+
+    public String getValDescription() { return valDescription; }
+    public void setValDescription(String valDescription) { this.valDescription = valDescription; }
+
+    public String getValName() { return valName; }
+    public void setValName(String valName) { this.valName = valName; }
+
+    public int getStepNumber() { return step_number; }
+    public void setStepNumber(int step_number) { this.step_number = step_number; }
+
+    public String getCreatedAt() { return created_at; }
+    public void setCreatedAt(String created_at) { this.created_at = created_at; }
+
+    public boolean isEnabled() { return enabled; }
+    public void setEnabled(boolean enabled) { this.enabled = enabled; }
+
+    public Map<String, Object> getExecutionProfiles() { return execution_profiles; }
+    public void setExecutionProfiles(Map<String, Object> execution_profiles) { this.execution_profiles = execution_profiles; }
+    public String getSourceDbName() { return sourceDbName; }
+    public void setSourceDbName(String sourceDbName) { this.sourceDbName = sourceDbName; }
+
+    public String getTargetDbName() { return targetDbName; }
+    public void setTargetDbName(String targetDbName) { this.targetDbName = targetDbName; }
+
+    public String getDistributedJoinKey() { return distributedJoinKey; }
+    public void setDistributedJoinKey(String distributedJoinKey) { this.distributedJoinKey = distributedJoinKey; }
+
+    public int getDistributedParallelism() { return distributedParallelism; }
+    public void setDistributedParallelism(int distributedParallelism) { this.distributedParallelism = distributedParallelism; }
+
+    public String getDistributedExpectedUpdates() { return distributedExpectedUpdates; }
+    public void setDistributedExpectedUpdates(String distributedExpectedUpdates) { this.distributedExpectedUpdates = distributedExpectedUpdates; }
+
+
+    @Override
+    public String toString() {
+        return "ValidationConfig{" +
+                "validationID='" + validationID + '\'' +
+                ", valName='" + valName + '\'' +
+                ", executionMode='" + executionMode + '\'' +
+                '}';
+    }
+}
