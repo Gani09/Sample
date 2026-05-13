@@ -1,0 +1,148 @@
+package com.fiserv.fef.kafka;
+
+import com.fiserv.fef.utils.MongoDBClientFactory;
+
+import java.io.Serializable;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Properties;
+
+public class KafkaConfig implements Serializable {
+
+    private static final long serialVersionUID = 1L;
+    private static String bootstrapServer;
+    private static String sslKeyStore;
+    private static String sslTrustStore;
+    private static String sslPwd;
+    private static String topics;
+
+    private static int mongoSinkBatchSize;
+    private static long mongoSinkFlushIntervalMs;
+    private static int mongoSinkMaxRetries;
+    private static long mongoSinkRetryDelayMs;
+
+    static {
+        Properties props = new Properties();
+        try (java.io.InputStream in = MongoDBClientFactory.class.getClassLoader().getResourceAsStream("application.properties")) {
+            if (in != null) {
+                props.load(in);
+                bootstrapServer = resolveEnv(props.getProperty("kafka.bootstrapServer", "localhost:9092"));
+                topics = resolveEnv(props.getProperty("kafka.topics", ""));
+                sslKeyStore = resolveEnv(props.getProperty("kafka.ssl.keystore.location", ""));
+                sslTrustStore = resolveEnv(props.getProperty("kafka.ssl.truststore.location", ""));
+                sslPwd = resolveEnv(props.getProperty("kafka.ssl.pwd", ""));
+                // Mongo sink properties
+                mongoSinkBatchSize = Integer.parseInt(props.getProperty("mongo.sink.batch.size", "500"));
+                mongoSinkFlushIntervalMs = Long.parseLong(props.getProperty("mongo.sink.flush.interval.ms", "2000"));
+                mongoSinkMaxRetries = Integer.parseInt(props.getProperty("mongo.sink.max.retries", "2"));
+                mongoSinkRetryDelayMs = Long.parseLong(props.getProperty("mongo.sink.retry.delay.ms", "1000"));
+            } else {
+                bootstrapServer = resolveEnv(System.getenv().getOrDefault("KAFKA_BOOTSTRAP_SERVER", "localhost:9092"));
+                topics = resolveEnv(System.getenv().getOrDefault("KAFKA_TOPICS", ""));
+                sslKeyStore = resolveEnv(System.getenv().getOrDefault("SSL_KEY_STORE", ""));
+                sslTrustStore = resolveEnv(System.getenv().getOrDefault("SSL_TRUST_STORE", ""));
+                sslPwd = resolveEnv(System.getenv().getOrDefault("KAFKA_SSL_PWD", ""));
+                // Mongo sink properties
+                mongoSinkBatchSize = Integer.parseInt(System.getenv().getOrDefault("MONGO_SINK_BATCH_SIZE", "500"));
+                mongoSinkFlushIntervalMs = Long.parseLong(System.getenv().getOrDefault("MONGO_SINK_FLUSH_INTERVAL_MS", "2000"));
+                mongoSinkMaxRetries = Integer.parseInt(System.getenv().getOrDefault("MONGO_SINK_MAX_RETRIES", "2"));
+                mongoSinkRetryDelayMs = Long.parseLong(System.getenv().getOrDefault("MONGO_SINK_RETRY_DELAY_MS", "1000"));
+            }
+        } catch (Exception e) {
+            bootstrapServer = resolveEnv(System.getenv().getOrDefault("KAFKA_BOOTSTRAP_SERVER", "localhost:9092"));
+            topics = resolveEnv(System.getenv().getOrDefault("KAFKA_TOPICS", ""));
+            sslKeyStore = resolveEnv(System.getenv().getOrDefault("SSL_KEY_STORE", ""));
+            sslTrustStore = resolveEnv(System.getenv().getOrDefault("SSL_TRUST_STORE", ""));
+            sslPwd = resolveEnv(System.getenv().getOrDefault("KAFKA_SSL_PWD", ""));
+            // Mongo sink properties
+            mongoSinkBatchSize = Integer.parseInt(System.getenv().getOrDefault("MONGO_SINK_BATCH_SIZE", "500"));
+            mongoSinkFlushIntervalMs = Long.parseLong(System.getenv().getOrDefault("MONGO_SINK_FLUSH_INTERVAL_MS", "2000"));
+            mongoSinkMaxRetries = Integer.parseInt(System.getenv().getOrDefault("MONGO_SINK_MAX_RETRIES", "2"));
+            mongoSinkRetryDelayMs = Long.parseLong(System.getenv().getOrDefault("MONGO_SINK_RETRY_DELAY_MS", "1000"));
+        }
+    }
+
+    public KafkaConfig() {
+    }
+
+    private static String resolveEnv(String value) {
+        if (value == null) return null;
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("\\$\\{([^:}]+):?([^}]*)\\}").matcher(value);
+        StringBuilder sb = new StringBuilder();
+        while (m.find()) {
+            String env = m.group(1);
+            String def = m.group(2);
+            String envVal = System.getenv(env);
+            m.appendReplacement(sb, envVal != null ? envVal : def);
+        }
+        m.appendTail(sb);
+        return sb.toString();
+    }
+
+    public String getBootstrapServer() {
+        return bootstrapServer;
+    }
+
+    public String getSslKeyStore() {
+        return sslKeyStore;
+    }
+
+    public String getSslTrustStore() {
+        return sslTrustStore;
+    }
+
+    public String getSslPwd() {
+        return sslPwd;
+    }
+
+    public int getMongoSinkBatchSize() { return mongoSinkBatchSize; }
+    public long getMongoSinkFlushIntervalMs() { return mongoSinkFlushIntervalMs; }
+    public int getMongoSinkMaxRetries() { return mongoSinkMaxRetries; }
+    public long getMongoSinkRetryDelayMs() { return mongoSinkRetryDelayMs; }
+
+    /**
+     * Returns Kafka properties for AdminClient, including security settings.
+     */
+    public Properties getKafkaAdminProperties() {
+        Properties props = new Properties();
+        props.put("bootstrap.servers", getBootstrapServer());
+        props.put("security.protocol", "SSL");
+        if (getSslKeyStore() != null && !getSslKeyStore().isEmpty()) {
+            props.put("ssl.keystore.location", getSslKeyStore());
+        }
+        if (getSslTrustStore() != null && !getSslTrustStore().isEmpty()) {
+            props.put("ssl.truststore.location", getSslTrustStore());
+        }
+        if (getSslPwd() != null && !getSslPwd().isEmpty()) {
+            props.put("ssl.keystore.password", getSslPwd());
+            props.put("ssl.truststore.password", getSslPwd());
+        }
+        // Add more security properties as needed (SASL, etc.)
+        return props;
+    }
+
+    public static class TopicGroup {
+        public final String topic;
+        public final String groupId;
+        public TopicGroup(String topic, String groupId) {
+            this.topic = topic;
+            this.groupId = groupId;
+        }
+    }
+
+    /**
+     * Parses kafka.topics property and returns a list of TopicGroup objects.
+     * Format: topic1:group1,topic2:group2
+     */
+    public List<TopicGroup> getTopicGroups() {
+        List<TopicGroup> result = new ArrayList<>();
+        if (topics == null || topics.isEmpty()) return result;
+        for (String entry : topics.split(",")) {
+            String[] parts = entry.trim().split(":", 2);
+            if (parts.length == 2) {
+                result.add(new TopicGroup(parts[0].trim(), parts[1].trim()));
+            }
+        }
+        return result;
+    }
+}
