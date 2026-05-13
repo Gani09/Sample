@@ -1,0 +1,5 @@
+package com.fiserv.fef.parquet.validation;
+
+public interface ValidationFailureWriter {
+    void write(ValidationFailure failure);
+}
