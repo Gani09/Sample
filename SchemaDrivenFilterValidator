@@ -1,0 +1,118 @@
+package com.fiserv.fef.parquet.schema;
+
+import com.fiserv.fef.parquet.filter.FilterSpec;
+import org.apache.parquet.schema.MessageType;
+
+import java.math.BigDecimal;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Builds FilterSpec list from raw filter map using schema.
+ * <p>
+ * Contract:
+ * record.match.anywhere=true
+ * - filter keys may be short (leaf name) or dot-path
+ * - short keys are resolved to ALL matching dot-paths in schema
+ * - predicate succeeds if ANY candidate path matches the expected value
+ * <p>
+ * record.match.anywhere=false
+ * - filter key MUST be a dot-path (explicit)
+ * - no schema-wide search is performed
+ * <p>
+ * Flat schema delimiter support:
+ * - if flatDelimiter is non-empty and an explicit dot-path is provided,
+ * validator will also try replacing '.' with flatDelimiter.
+ */
+public final class SchemaDrivenFilterValidator {
+
+    private SchemaDrivenFilterValidator() {
+    }
+
+    public static List<FilterSpec> validate(MessageType schema,
+                                            Map<String, String> rawFilters,
+                                            boolean matchAnywhere,
+                                            String flatDelimiter) {
+
+        if (rawFilters == null || rawFilters.isEmpty()) {
+            return List.of();
+        }
+
+        SchemaPathIndex idx = SchemaPathIndex.build(schema);
+        String delim = (flatDelimiter == null) ? "" : flatDelimiter.trim();
+
+        List<FilterSpec> specs = new ArrayList<>();
+
+        for (Map.Entry<String, String> e : rawFilters.entrySet()) {
+            String key = e.getKey() == null ? "" : e.getKey().trim();
+            String val = e.getValue() == null ? "" : e.getValue().trim();
+
+            if (key.isEmpty()) continue;
+
+            // record.match.anywhere=false requires dot-path
+            if (!matchAnywhere && !key.contains(".")) {
+                throw new IllegalArgumentException(
+                        "record.match.anywhere=false requires dot-path filter key. " +
+                                "Invalid key='" + key + "'");
+            }
+
+            List<String> resolvedPaths;
+
+            if (key.contains(".")) {
+                // explicit path
+                resolvedPaths = resolveExplicitPath(idx, key, delim);
+            } else {
+                // short leaf name - only allowed when matchAnywhere=true
+                List<String> cands = idx.leafToPaths.get(key);
+                if (cands == null || cands.isEmpty()) {
+                    throw new IllegalArgumentException("Filter field not found in schema: '" + key + "'");
+                }
+                resolvedPaths = cands;
+            }
+
+            // Best-effort typed coercion: if value is decimal-like try BigDecimal
+            Object expectedTyped = coerceBestEffort(val);
+
+            specs.add(new FilterSpec(key, resolvedPaths, "eq", val, expectedTyped, matchAnywhere));
+        }
+
+        return specs;
+    }
+
+    private static List<String> resolveExplicitPath(SchemaPathIndex idx, String key, String delim) {
+        // Prefer exact dot-path
+        if (idx.allPaths.contains(key)) {
+            return List.of(key);
+        }
+
+        // If schema is flat with delimiter, try translation
+        if (!delim.isEmpty()) {
+            String flat = key.replace(".", delim);
+            if (idx.allPaths.contains(flat)) {
+                return List.of(flat);
+            }
+        }
+
+        // Not found
+        throw new IllegalArgumentException(
+                "Filter dot-path not found in schema: '" + key + "'" +
+                        (delim.isEmpty() ? "" : " (also tried replacing '.' with '" + delim + "')"));
+    }
+
+    private static Object coerceBestEffort(String raw) {
+        if (raw == null) return null;
+        String s = raw.trim();
+        if (s.isEmpty()) return "";
+
+        // BigDecimal
+        try {
+            // avoid treating leading zeros + long strings as scientific; BigDecimal handles
+            if (s.matches("[-+]?\\d+(\\.\\d+)?")) {
+                return new BigDecimal(s);
+            }
+        } catch (Exception ignore) {
+        }
+        return s;
+    }
+}
