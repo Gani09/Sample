@@ -1,0 +1,81 @@
+package com.fiserv.fef.models;
+
+import java.io.Serializable;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.List;
+
+/**
+ * Result of validation execution
+ */
+public class ValidationResult implements Serializable {
+    
+    private String validationID;
+    private String processID;
+    private String pipelineRunID;
+    private String validationDate;
+    private String featureName;
+    private boolean passed;
+    private List<ScenarioResult> scenarioResults;
+    private String errorMessage;
+    private Date executedAt;
+    private long durationMs;
+    
+    public ValidationResult() {
+        this.scenarioResults = new ArrayList<>();
+        this.executedAt = new Date();
+    }
+    
+    public ValidationResult(String validationID) {
+        this();
+        this.validationID = validationID;
+    }
+    
+    // Getters and Setters
+    public String getValidationID() { return validationID; }
+    public void setValidationID(String validationID) { this.validationID = validationID; }
+
+    public String getProcessID() { return processID; }
+    public void setProcessID(String processID) { this.processID = processID; }
+
+    public String getPipelineRunID() { return pipelineRunID; }
+    public void setPipelineRunID(String pipelineRunID) { this.pipelineRunID = pipelineRunID; }
+
+    public String getValidationDate() { return validationDate; }
+    public void setValidationDate(String validationDate) { this.validationDate = validationDate; }
+
+    public String getFeatureName() { return featureName; }
+    public void setFeatureName(String featureName) { this.featureName = featureName; }
+    
+    public boolean isPassed() { return passed; }
+    public void setPassed(boolean passed) { this.passed = passed; }
+    
+    public List<ScenarioResult> getScenarioResults() { return scenarioResults; }
+    public void setScenarioResults(List<ScenarioResult> scenarioResults) { this.scenarioResults = scenarioResults; }
+    
+    public String getErrorMessage() { return errorMessage; }
+    public void setErrorMessage(String errorMessage) { this.errorMessage = errorMessage; }
+    
+    public Date getExecutedAt() { return executedAt; }
+    public void setExecutedAt(Date executedAt) { this.executedAt = executedAt; }
+    
+    public long getDurationMs() { return durationMs; }
+    public void setDurationMs(long durationMs) { this.durationMs = durationMs; }
+    
+    public void addScenarioResult(ScenarioResult result) {
+        this.scenarioResults.add(result);
+        if (!result.isPassed()) {
+            this.passed = false;
+        }
+    }
+    
+    @Override
+    public String toString() {
+        return "ValidationResult{" +
+                "validationID='" + validationID + '\'' +
+                ", passed=" + passed +
+                ", scenarios=" + scenarioResults.size() +
+                ", duration=" + durationMs + "ms" +
+                '}';
+    }
+}
