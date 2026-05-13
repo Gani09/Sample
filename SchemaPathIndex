@@ -1,0 +1,38 @@
+package com.fiserv.fef.parquet.schema;
+
+import org.apache.parquet.schema.MessageType;
+import org.apache.parquet.schema.Type;
+
+import java.util.*;
+
+/**
+ * Utility to flatten a Parquet schema into leaf-name -> list of dot-paths.
+ */
+final class SchemaPathIndex {
+
+    final Map<String, List<String>> leafToPaths = new LinkedHashMap<>();
+    final Set<String> allPaths = new HashSet<>();
+
+    static SchemaPathIndex build(MessageType schema) {
+        SchemaPathIndex idx = new SchemaPathIndex();
+        for (Type t : schema.getFields()) {
+            walk("", t, idx);
+        }
+        return idx;
+    }
+
+    private static void walk(String prefix, Type type, SchemaPathIndex idx) {
+        String name = type.getName();
+        String path = prefix.isEmpty() ? name : prefix + "." + name;
+
+        if (type.isPrimitive()) {
+            idx.allPaths.add(path);
+            idx.leafToPaths.computeIfAbsent(name, k -> new ArrayList<>()).add(path);
+            return;
+        }
+
+        for (Type f : type.asGroupType().getFields()) {
+            walk(path, f, idx);
+        }
+    }
+}
