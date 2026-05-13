@@ -1,0 +1,167 @@
+package com.fiserv.fef.stepdefs;
+
+import com.fiserv.fef.gherkin.ValidationContext;
+import com.fiserv.fef.gherkin.annotations.Given;
+import com.fiserv.fef.gherkin.annotations.When;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
+
+/**
+ * Utility step definitions for common operations
+ */
+public class UtilitySteps {
+
+    private static final Logger LOG = LoggerFactory.getLogger(UtilitySteps.class);
+
+    /**
+     * Set a variable in context
+     * Example: Given I set variable "threshold" to "1000"
+     */
+    @Given("I set variable {string} to {string}")
+    public void setVariableTo(String variableName, String value) {
+        LOG.info("Setting variable: {} = {}", variableName, value);
+
+        ValidationContext context = ValidationContext.getCurrent();
+        context.setVariable(variableName, value);
+    }
+
+    /**
+     * Log a message
+     * Example: When I log "Starting validation"
+     */
+    @When("I log {string}")
+    public void log(String message) {
+        LOG.info("LOG: {}", message);
+
+        ValidationContext context = ValidationContext.getCurrent();
+        context.setVariable("last_log_message", message);
+    }
+
+    /**
+     * Wait for a specified duration (for testing)
+     * Example: When I wait 2 seconds
+     */
+    @When("I wait {int} seconds")
+    public void waitSeconds(int seconds) {
+        LOG.info("Waiting {} seconds", seconds);
+
+        try {
+            Thread.sleep(seconds * 1000L);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Wait interrupted", e);
+        }
+
+        LOG.info("Wait complete");
+    }
+
+    /**
+     * Convert string date to another format
+     * Example: When I convert date "2025-02-26" from "yyyy-MM-dd" to "yyyyMMdd"
+     */
+    @When("I convert date {string} from {string} to {string}")
+    public void convertDateFormat(String dateString, String fromFormat, String toFormat) {
+        LOG.info("Converting date: {} from {} to {}", dateString, fromFormat, toFormat);
+
+        ValidationContext context = ValidationContext.getCurrent();
+
+        DateTimeFormatter fromFormatter = DateTimeFormatter.ofPattern(fromFormat);
+        DateTimeFormatter toFormatter = DateTimeFormatter.ofPattern(toFormat);
+
+        LocalDate date = LocalDate.parse(dateString, fromFormatter);
+        String convertedDate = date.format(toFormatter);
+
+        context.setVariable("converted_date", convertedDate);
+
+        LOG.info("Converted date: {}", convertedDate);
+    }
+
+    /**
+     * Calculate date offset
+     * Example: When I calculate date 3 days before "2025-02-26"
+     */
+    @When("I calculate date {int} days before {string}")
+    public void calculateDateDaysBefore(int days, String dateString) {
+        LOG.info("Calculating {} days before {}", days, dateString);
+
+        ValidationContext context = ValidationContext.getCurrent();
+
+        LocalDate date = LocalDate.parse(dateString);
+        LocalDate calculatedDate = date.minusDays(days);
+        String result = calculatedDate.toString();
+
+        context.setVariable("calculated_date", result);
+
+        LOG.info("Calculated date: {}", result);
+    }
+
+    /**
+     * Store current timestamp
+     * Example: When I store current timestamp
+     */
+    @When("I store current timestamp")
+    public void storeCurrentTimestamp() {
+        long timestamp = System.currentTimeMillis();
+
+        ValidationContext context = ValidationContext.getCurrent();
+        context.setVariable("current_timestamp", timestamp);
+
+        LOG.info("Stored timestamp: {}", timestamp);
+    }
+
+    /**
+     * Calculate elapsed time
+     * Example: When I calculate elapsed time since stored timestamp
+     */
+    @When("I calculate elapsed time since stored timestamp")
+    public void calculateElapsedTimeSinceStoredTimestamp() {
+        ValidationContext context = ValidationContext.getCurrent();
+
+        Long startTimestamp = context.getVariable("current_timestamp", Long.class);
+        if (startTimestamp == null) {
+            throw new IllegalStateException("No timestamp stored");
+        }
+
+        long currentTimestamp = System.currentTimeMillis();
+        long elapsedMs = currentTimestamp - startTimestamp;
+
+        context.setVariable("elapsed_time_ms", elapsedMs);
+        context.setVariable("elapsed_time_seconds", elapsedMs / 1000.0);
+
+        LOG.info("Elapsed time: {}ms ({}s)", elapsedMs, elapsedMs / 1000.0);
+    }
+
+    /**
+     * Format number with thousands separator
+     * Example: When I format number 1000000 as "formatted_number"
+     */
+    @When("I format number {long} as {string}")
+    public void formatNumberAs(long number, String variableName) {
+        LOG.info("Formatting number: {}", number);
+
+        ValidationContext context = ValidationContext.getCurrent();
+
+        String formatted = String.format("%,d", number);
+        context.setVariable(variableName, formatted);
+
+        LOG.info("Formatted: {}", formatted);
+    }
+
+    /**
+     * Clear context variables (for testing)
+     * Example: When I clear all variables
+     */
+    @When("I clear all variables")
+    public void clearAllVariables() {
+        LOG.info("Clearing all variables");
+
+        ValidationContext context = ValidationContext.getCurrent();
+        context.getVariables().clear();
+        context.getDatasets().clear();
+
+        LOG.info("Variables cleared");
+    }
+}
