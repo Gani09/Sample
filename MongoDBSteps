@@ -1,0 +1,144 @@
+package com.fiserv.fef.stepdefs;
+
+import com.fiserv.fef.gherkin.ValidationContext;
+import com.fiserv.fef.utils.MongoDBClientFactory;
+import com.mongodb.client.MongoCollection;
+import com.mongodb.client.MongoDatabase;
+import com.fiserv.fef.gherkin.annotations.Given;
+import com.fiserv.fef.gherkin.annotations.When;
+import org.bson.Document;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * Step definitions for MongoDB-specific operations
+ */
+public class MongoDBSteps {
+
+    private static final Logger LOG = LoggerFactory.getLogger(MongoDBSteps.class);
+
+    private static MongoDatabase tenantDatabase() {
+        ValidationContext ctx = ValidationContext.getCurrent();
+        if (ctx != null && ctx.getSrcTenantDatabase() != null) {
+            return ctx.getSrcTenantDatabase();
+        } if (ctx != null && ctx.getTargetTenantDatabase() != null) {
+            return ctx.getTargetTenantDatabase();
+        }
+        return MongoDBClientFactory.getDatabase();
+    }
+
+    /**
+     * Execute MongoDB aggregation
+     * Example: When I execute aggregation on "Account_current" with pipeline
+     */
+    @When("I execute aggregation on {string}")
+    public void executeAggregationOn(String collectionName) {
+        LOG.info("Executing aggregation on: {}", collectionName);
+
+        ValidationContext context = ValidationContext.getCurrent();
+        MongoDatabase database = tenantDatabase();
+        MongoCollection<Document> collection = database.getCollection(collectionName);
+
+        // Get pipeline from context (should be set by previous step)
+        @SuppressWarnings("unchecked")
+        List<Document> pipeline = (List<Document>) context.getVariable("aggregation_pipeline");
+
+        if (pipeline == null) {
+            throw new IllegalStateException("Aggregation pipeline not defined");
+        }
+
+        // Execute aggregation
+        List<Document> results = collection.aggregate(pipeline).into(new ArrayList<>());
+
+        // Store results
+        context.setVariable("aggregation_results", results);
+        context.setVariable("aggregation_result_count", results.size());
+
+        LOG.info("Aggregation completed: {} results", results.size());
+    }
+
+    /**
+     * Check if collection exists
+     * Example: Given collection "Account_current" exists
+     */
+    @Given("collection {string} exists")
+    public void collectionExists(String collectionName) {
+        LOG.info("Checking if collection exists: {}", collectionName);
+
+        MongoDatabase database = tenantDatabase();
+
+        boolean exists = false;
+        for (String name : database.listCollectionNames()) {
+            if (name.equals(collectionName)) {
+                exists = true;
+                break;
+            }
+        }
+
+        if (!exists) {
+            throw new AssertionError("Collection does not exist: " + collectionName);
+        }
+
+        LOG.info("Collection exists: {}", collectionName);
+    }
+
+    /**
+     * Check if collection has index
+     * Example: When I check if "Account_current" has index on "accountUuid"
+     */
+    @When("I check if {string} has index on {string}")
+    public void checkIfCollectionHasIndexOn(String collectionName, String fieldName) {
+        LOG.info("Checking if {} has index on {}", collectionName, fieldName);
+
+        ValidationContext context = ValidationContext.getCurrent();
+        MongoDatabase database = tenantDatabase();
+        MongoCollection<Document> collection = database.getCollection(collectionName);
+
+        boolean hasIndex = false;
+
+        for (Document index : collection.listIndexes()) {
+            Document key = (Document) index.get("key");
+            if (key != null && key.containsKey(fieldName)) {
+                hasIndex = true;
+                break;
+            }
+        }
+
+        context.setVariable("has_index", hasIndex);
+        context.setVariable("index_field", fieldName);
+
+        LOG.info("Collection {} {} index on {}",
+                collectionName, hasIndex ? "has" : "does not have", fieldName);
+    }
+
+    /**
+     * Get collection statistics
+     * Example: When I get statistics for "ServicingOrderProcedure"
+     */
+    @When("I get statistics for {string}")
+    public void getStatisticsFor(String collectionName) {
+        LOG.info("Getting statistics for: {}", collectionName);
+
+        ValidationContext context = ValidationContext.getCurrent();
+        MongoDatabase database = tenantDatabase();
+
+        // Run collStats command
+        Document stats = database.runCommand(
+                new Document("collStats", collectionName)
+        );
+
+        long count = stats.getLong("count");
+        long size = stats.getLong("size");
+        long storageSize = stats.getLong("storageSize");
+
+        context.setVariable("collection_count", count);
+        context.setVariable("collection_size", size);
+        context.setVariable("collection_storage_size", storageSize);
+
+        LOG.info("Collection stats: count={}, size={}, storageSize={}",
+                count, size, storageSize);
+    }
+}
