@@ -1,0 +1,90 @@
+package com.fiserv.fef.gherkin;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+public class SimpleDataTable {
+
+    private final List<List<String>> rows;
+
+    public SimpleDataTable(List<List<String>> rows) {
+        if (rows == null || rows.isEmpty()) {
+            throw new IllegalArgumentException("Data table cannot be empty");
+        }
+        this.rows = new ArrayList<>();
+        for (List<String> r : rows) {
+            List<String> copy = new ArrayList<>();
+            if (r != null) copy.addAll(r);
+            this.rows.add(copy);
+        }
+    }
+
+    public List<List<String>> asLists() {
+        List<List<String>> out = new ArrayList<>();
+        for (List<String> r : rows) out.add(new ArrayList<>(r));
+        return out;
+    }
+
+    public <K, V> List<Map<K, V>> asMaps(Class<K> keyType, Class<V> valueType) {
+        if (rows.size() < 2) return Collections.emptyList();
+
+        List<String> headers = rows.get(0);
+        List<Map<K, V>> result = new ArrayList<>();
+
+        for (int i = 1; i < rows.size(); i++) {
+            List<String> row = rows.get(i);
+            Map<K, V> map = new LinkedHashMap<>();
+
+            for (int c = 0; c < headers.size(); c++) {
+                String h = headers.get(c);
+                String v = (c < row.size()) ? row.get(c) : null;
+                map.put(convert(h, keyType), convert(v, valueType));
+            }
+            result.add(map);
+        }
+
+        return result;
+    }
+
+
+
+    /**
+     * Get height (number of rows)
+     */
+    public int height() {
+        return rows.size();
+    }
+
+    /**
+     * Get width (number of columns in first row)
+     */
+    public int width() {
+        return rows.isEmpty() ? 0 : rows.get(0).size();
+    }
+
+    /**
+     * Check if table is empty
+     */
+    public boolean isEmpty() {
+        return rows.isEmpty();
+    }
+
+    @SuppressWarnings("unchecked")
+    private static <T> T convert(String value, Class<T> targetType) {
+        if (targetType == String.class) return (T) value;
+        if (value == null) return null;
+        if (targetType == Integer.class || targetType == int.class) return (T) Integer.valueOf(value);
+        if (targetType == Long.class || targetType == long.class) return (T) Long.valueOf(value);
+        if (targetType == Double.class || targetType == double.class) return (T) Double.valueOf(value);
+        if (targetType == Boolean.class || targetType == boolean.class) return (T) Boolean.valueOf(value);
+        return (T) value;
+    }
+
+    @Override
+    public String toString() {
+        return "SimpleDataTable{rows=" + rows.size() + ", width=" + (rows.isEmpty() ? 0 : rows.get(0).size()) + "}";
+    }
+}
