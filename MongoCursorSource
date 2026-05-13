@@ -1,0 +1,341 @@
+package com.fiserv.fef.datasources;
+
+import com.fiserv.fef.exceptions.DataAccessException;
+import com.fiserv.fef.models.DataQuery;
+import com.fiserv.fef.models.Dataset;
+import com.fiserv.fef.utils.MongoDBClientFactory;
+import com.mongodb.MongoCommandException;
+import com.mongodb.client.*;
+import org.bson.Document;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.*;
+
+/**
+ * MongoDB data source using cursor-based streaming
+ * Best for: small to medium datasets (< 100k documents)
+ * Performance: Memory-safe with batching, good for simple queries
+ */
+public class MongoCursorSource implements DataSource {
+
+    private static final Logger LOG = LoggerFactory.getLogger(MongoCursorSource.class);
+
+    private static final int DEFAULT_BATCH_SIZE = 10000;
+
+    private final MongoDatabase database;
+    private final int batchSize;
+
+    private MongoCollection<Document> tenantCollection(String collectionName) {
+        if (collectionName == null || collectionName.trim().isEmpty()) {
+            throw new IllegalArgumentException(
+                    "Collection name must not be null or empty. " +
+                            "Check the Gherkin feature text for a missing collection name.");
+        }
+        if (collectionName.contains(".")) {
+            int dotIndex = collectionName.indexOf('.');
+            String dbName = collectionName.substring(0, dotIndex);
+            String coll   = collectionName.substring(dotIndex + 1);
+            LOG.debug("Dot-prefix: using database '{}', collection '{}'  [overrides source/target dbName]",
+                    dbName, coll);
+            MongoClient client = MongoDBClientFactory.getClient();
+            return client.getDatabase(dbName).getCollection(coll);
+        }
+        LOG.debug("Plain collection '{}': using context database '{}'  [source/target dbName routing]",
+                collectionName, database.getName());
+
+        return database.getCollection(collectionName);
+    }
+
+    // FIX 1: resolveDbName() is now called in every INFO log (was defined but never used)
+    private String resolveDbName(String collectionName) {
+        if (collectionName != null && collectionName.contains(".")) {
+            return collectionName.substring(0, collectionName.indexOf('.')) + " [dot-prefix override]";
+        }
+        return database.getName() + " [source/target dbName]";
+    }
+
+    // FIX 3: new helper — catches Unauthorized (code 13) and logs clear actionable guidance
+    private void handleMongoCommandException(MongoCommandException e, String collectionName) {
+        if (e.getErrorCode() == 13) {
+            LOG.error("=======================================================================");
+            LOG.error("AUTHORIZATION ERROR  —  collection : {}", collectionName);
+            LOG.error("  Resolved database  : {}", resolveDbName(collectionName));
+            LOG.error("  MongoDB error      : {}", e.getErrorMessage());
+            LOG.error("-----------------------------------------------------------------------");
+            LOG.error("HOW TO FIX:");
+            if (collectionName != null && collectionName.contains(".")) {
+                String dotDb = collectionName.substring(0, collectionName.indexOf('.'));
+                LOG.error("  Collection uses dot-prefix → DB '{}' is accessed directly.", dotDb);
+                LOG.error("  → Grant the MongoDB user read access on the '{}' database.", dotDb);
+            } else {
+                LOG.error("  Collection '{}' was routed to DB '{}' via source_dbName/target_dbName.",
+                        collectionName, database.getName());
+                LOG.error("  → OPTION 1: Grant the MongoDB user read access on '{}' database.", database.getName());
+                LOG.error("  → OPTION 2: Use dot-prefix in Gherkin feature text, e.g. '{}.{}'",
+                        database.getName(), collectionName);
+                LOG.error("  → OPTION 3: Update source_dbName/target_dbName in fef_validation_pipeline"
+                        + " to a DB the user can access.");
+            }
+            LOG.error("=======================================================================");
+        } else {
+            LOG.error("MongoDB command error (code={}): collection='{}', message={}",
+                    e.getErrorCode(), collectionName, e.getErrorMessage());
+        }
+    }
+
+    public MongoCursorSource() {
+        this.database = MongoDBClientFactory.getDatabase();
+        if (this.database == null) {
+            throw new IllegalStateException("MongoDB database is null. Failed to initialize MongoCursorSource.");
+        }
+        this.batchSize = DEFAULT_BATCH_SIZE;
+        LOG.debug("MongoCursorSource initialized with default database and batch size {}", batchSize);
+    }
+
+    public MongoCursorSource(MongoDatabase database) {
+        if (database == null) {
+            throw new IllegalArgumentException("MongoDB database cannot be null");
+        }
+        this.database = database;
+        this.batchSize = DEFAULT_BATCH_SIZE;
+        LOG.debug("MongoCursorSource initialized with custom database and batch size {}", batchSize);
+    }
+
+    public MongoCursorSource(MongoDatabase database, int batchSize) {
+        if (database == null) {
+            throw new IllegalArgumentException("MongoDB database cannot be null");
+        }
+        this.database = database;
+        this.batchSize = batchSize;
+        LOG.debug("MongoCursorSource initialized with custom database and batch size {}", batchSize);
+    }
+
+    @Override
+    public Dataset load(DataQuery query) {
+        // FIX 1: resolveDbName() now called so the actual DB appears in every log line
+        LOG.info("Loading data via cursor: collection='{}', db={}",
+                query.getCollection(), resolveDbName(query.getCollection()));
+
+        LOG.debug("Query filter: {}", query.getFilter());
+        LOG.debug("Query projection: {}", query.getProjection());
+        LOG.debug("Query sort: {}", query.getSort());
+
+        try {
+            MongoCollection<Document> collection = tenantCollection(query.getCollection());
+
+            // Build find query
+            FindIterable<Document> findIterable = collection.find(query.getFilter())
+                    .batchSize(batchSize)
+                    .noCursorTimeout(true);  // Prevent timeout for long processing
+
+            LOG.debug("Created FindIterable with filter: {}", query.getFilter());
+
+            // Apply projection
+            if (query.getProjection() != null && !query.getProjection().isEmpty()) {
+                findIterable = findIterable.projection(query.getProjection());
+            }
+
+            // Apply sort
+            if (query.getSort() != null && !query.getSort().isEmpty()) {
+                findIterable = findIterable.sort(query.getSort());
+            }
+
+            // Apply skip
+            if (query.getSkip() != null && query.getSkip() > 0) {
+                findIterable = findIterable.skip(query.getSkip());
+            }
+
+            // Apply limit
+            if (query.getLimit() != null && query.getLimit() > 0) {
+                findIterable = findIterable.limit(query.getLimit());
+            }
+
+            // Load data in batches
+            Dataset dataset = new Dataset(query.getCollection());
+
+            long startTime = System.currentTimeMillis();
+            int count = 0;
+
+            try (MongoCursor<Document> cursor = findIterable.iterator()) {
+                while (cursor.hasNext()) {
+                    Document doc = cursor.next();
+                    dataset.addDocument(doc);
+                    count++;
+
+                    if (count % 10000 == 0) {
+                        LOG.debug("Loaded {} documents...", count);
+                    }
+                }
+            }
+
+            long duration = System.currentTimeMillis() - startTime;
+            LOG.info("Loaded {} documents in {}ms", count, duration);
+
+            return dataset;
+        } catch (MongoCommandException e) {
+            handleMongoCommandException(e, query.getCollection()); // FIX 3
+            throw new DataAccessException("Failed to load data via cursor", query.getCollection(), "find", e);
+        } catch (Exception e) {
+            LOG.error("Failed to load data via cursor: collection={}", query.getCollection(), e);
+            throw new DataAccessException(
+                    "Failed to load data via cursor",
+                    query.getCollection(),
+                    "find",
+                    e
+            );
+        }
+    }
+
+    @Override
+    public long count(DataQuery query) {
+        // FIX 1: resolveDbName() now called
+        LOG.info("Counting documents: collection='{}', db={}",
+                query.getCollection(), resolveDbName(query.getCollection()));
+        try {
+            MongoCollection<Document> collection = tenantCollection(query.getCollection());
+            long count = collection.countDocuments(query.getFilter());
+
+            LOG.info("Count result: {} documents", count);
+            return count;
+        } catch (MongoCommandException e) {
+            handleMongoCommandException(e, query.getCollection()); // FIX 3
+            throw new DataAccessException("Failed to count documents", query.getCollection(), "count", e);
+        } catch (Exception e) {
+            LOG.error("Failed to count documents: collection={}", query.getCollection(), e);
+            throw new DataAccessException(
+                    "Failed to count documents",
+                    query.getCollection(),
+                    "count",
+                    e
+            );
+        }
+    }
+
+    @Override
+    public Set<Object> distinct(String field, DataQuery query) {
+        // FIX 1: resolveDbName() now called
+        LOG.info("Getting distinct values: collection='{}', db={}, field='{}'",
+                query.getCollection(), resolveDbName(query.getCollection()), field);
+        try {
+            MongoCollection<Document> collection = tenantCollection(query.getCollection());
+
+            // Use MongoDB's distinct operation
+            Set<Object> distinctValues = new HashSet<>();
+
+            if (query.getFilter() != null && !query.getFilter().isEmpty()) {
+                // With filter
+                collection.distinct(field, query.getFilter(), Object.class)
+                        .into(new ArrayList<>())
+                        .forEach(distinctValues::add);
+            } else {
+                // Without filter
+                collection.distinct(field, Object.class)
+                        .into(new ArrayList<>())
+                        .forEach(distinctValues::add);
+            }
+
+            LOG.info("Found {} distinct values for field '{}'", distinctValues.size(), field);
+            return distinctValues;
+        } catch (MongoCommandException e) {
+            handleMongoCommandException(e, query.getCollection()); // FIX 3
+            throw new DataAccessException("Failed to get distinct values", query.getCollection(), "distinct", e);
+        } catch (Exception e) {
+            LOG.error("Failed to get distinct values: collection='{}', field='{}'",
+                    query.getCollection(), field, e);
+            throw new DataAccessException("Failed to get distinct values", query.getCollection(), "distinct", e);
+        }
+    }
+
+    @Override
+    public List<Document> aggregate(String collection, List<Document> pipeline) {
+        // FIX 1: resolveDbName() now called
+        LOG.info("Executing aggregation pipeline: collection='{}', db={}, stages={}",
+                collection, resolveDbName(collection), pipeline.size());
+        try {
+            MongoCollection<Document> coll = database.getCollection(collection);
+            List<Document> results = coll.aggregate(pipeline).into(new ArrayList<>());
+
+            LOG.info("Aggregation completed: {} results", results.size());
+            return results;
+        } catch (MongoCommandException e) {
+            handleMongoCommandException(e, collection); // FIX 3
+            throw new DataAccessException("Failed to execute aggregation", collection, "aggregate", e);
+        } catch (Exception e) {
+            LOG.error("Failed to execute aggregation: collection={}", collection, e);
+            throw new DataAccessException(
+                    "Failed to execute aggregation",
+                    collection,
+                    "aggregate",
+                    e
+            );
+        }
+    }
+
+    @Override
+    public String getSourceType() {
+        return "mongodb_cursor";
+    }
+
+    /**
+     * Load data in batches with callback processing
+     * Useful for processing large datasets without loading all into memory
+     */
+    public void loadInBatches(DataQuery query, BatchProcessor processor) {
+        // FIX 1: resolveDbName() now called
+        LOG.info("Loading data in batches: collection='{}', db={}, batchSize={}",
+                query.getCollection(), resolveDbName(query.getCollection()), batchSize);
+        try {
+            MongoCollection<Document> collection = tenantCollection(query.getCollection());
+
+            FindIterable<Document> findIterable = collection.find(query.getFilter())
+                    .batchSize(batchSize)
+                    .noCursorTimeout(true);
+
+            List<Document> batch = new ArrayList<>();
+            int totalProcessed = 0;
+
+            try (MongoCursor<Document> cursor = findIterable.iterator()) {
+                while (cursor.hasNext()) {
+                    Document doc = cursor.next();
+                    batch.add(doc);
+
+                    if (batch.size() >= batchSize) {
+                        processor.processBatch(batch);
+                        totalProcessed += batch.size();
+                        batch.clear();
+
+                        LOG.debug("Processed {} documents...", totalProcessed);
+                    }
+                }
+
+                // Process remaining documents
+                if (!batch.isEmpty()) {
+                    processor.processBatch(batch);
+                    totalProcessed += batch.size();
+                }
+            }
+
+            LOG.info("Completed batch processing: {} total documents", totalProcessed);
+        } catch (MongoCommandException e) {
+            handleMongoCommandException(e, query.getCollection()); // FIX 3
+            throw new DataAccessException("Failed to load data in batches", query.getCollection(), "find_batched", e);
+        } catch (Exception e) {
+            LOG.error("Failed to load data in batches: collection={}", query.getCollection(), e);
+            throw new DataAccessException(
+                    "Failed to load data in batches",
+                    query.getCollection(),
+                    "find_batched",
+                    e
+            );
+        }
+    }
+
+    /**
+     * Functional interface for batch processing
+     */
+    @FunctionalInterface
+    public interface BatchProcessor {
+        void processBatch(List<Document> batch);
+    }
+}
