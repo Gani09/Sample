@@ -1,0 +1,209 @@
+package com.fiserv.fef.jobs.executors;
+
+import com.fiserv.fef.models.ScenarioDetails;
+import com.fiserv.fef.models.ScenarioResult;
+import com.fiserv.fef.models.StepResult;
+import com.fiserv.fef.models.ValidationResult;
+import com.mongodb.client.MongoClient;
+import com.mongodb.client.MongoClients;
+import com.mongodb.client.MongoCollection;
+import com.mongodb.client.MongoDatabase;
+import org.bson.Document;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.List;
+
+/**
+ * Writes validation results to MongoDB
+ * Used by worker jobs to persist their results
+ */
+public class ResultWriter {
+
+    private static final Logger LOG = LoggerFactory.getLogger(ResultWriter.class);
+
+    private final MongoClient mongoClient;
+    private final MongoCollection<Document> resultsCollection;
+
+    public ResultWriter(String mongoUri, String databaseName, String resultsCollectionName) {
+        LOG.info("Initializing ResultWriter: database={}, collection={}", databaseName, resultsCollectionName);
+
+        this.mongoClient = MongoClients.create(mongoUri);
+        MongoDatabase database = mongoClient.getDatabase(databaseName);
+        this.resultsCollection = database.getCollection(resultsCollectionName);
+
+        // Create indexes
+        createIndexes();
+    }
+
+    /**
+     * Write validation result to MongoDB
+     */
+    public void writeResult(ValidationResult result) {
+        LOG.info("Writing validation result: validationID={}, passed={}",
+                result.getValidationID(), result.isPassed());
+
+        try {
+            // Convert to MongoDB document
+            Document resultDoc = convertToDocument(result);
+
+            // Insert into MongoDB
+            resultsCollection.insertOne(resultDoc);
+
+            LOG.info("Result written successfully: validationID={}", result.getValidationID());
+
+        } catch (Exception e) {
+            LOG.error("Failed to write result: validationID={}", result.getValidationID(), e);
+            throw new RuntimeException("Failed to write result", e);
+        }
+    }
+
+    /**
+     * Convert ValidationResult to MongoDB document
+     */
+    private Document convertToDocument(ValidationResult result) {
+        Document doc = new Document()
+                .append("validationID", result.getValidationID())
+                .append("processID", result.getProcessID())
+                .append("pipelineRunID", result.getPipelineRunID())
+                .append("validationDate", result.getValidationDate())
+                .append("feature_name", result.getFeatureName())
+                .append("passed", result.isPassed())
+                .append("executed_at", result.getExecutedAt())
+                .append("duration_ms", result.getDurationMs())
+                .append("created_at", new Date());
+
+        // Add error message if present
+        if (result.getErrorMessage() != null) {
+            doc.append("error_message", result.getErrorMessage());
+        }
+
+        // Add scenario results
+        if (result.getScenarioResults() != null && !result.getScenarioResults().isEmpty()) {
+            List<Document> scenarioDocs = new ArrayList<>();
+
+            for (ScenarioResult scenarioResult : result.getScenarioResults()) {
+                scenarioDocs.add(convertScenarioToDocument(scenarioResult));
+            }
+
+            doc.append("scenario_results", scenarioDocs);
+            doc.append("total_scenarios", scenarioDocs.size());
+            doc.append("passed_scenarios",
+                    scenarioDocs.stream().filter(d -> d.getBoolean("passed", false)).count());
+        }
+
+        return doc;
+    }
+
+    /**
+     * Convert ScenarioResult to MongoDB document
+     */
+    private Document convertScenarioToDocument(ScenarioResult scenarioResult) {
+        Document doc = new Document()
+                .append("scenario_name", scenarioResult.getScenarioName())
+                .append("passed", scenarioResult.isPassed())
+                .append("duration_ms", scenarioResult.getDurationMs());
+
+        // Add failure message if present
+        if (scenarioResult.getFailureMessage() != null) {
+            doc.append("failure_message", scenarioResult.getFailureMessage());
+        }
+
+        // Add step results
+        if (scenarioResult.getStepResults() != null && !scenarioResult.getStepResults().isEmpty()) {
+            List<Document> stepDocs = new ArrayList<>();
+
+            for (StepResult stepResult : scenarioResult.getStepResults()) {
+                stepDocs.add(convertStepToDocument(stepResult));
+            }
+
+            doc.append("step_results", stepDocs);
+            doc.append("total_steps", stepDocs.size());
+        }
+
+        // Add scenario-level details (source/target counts, ratios, etc.) if present
+        Object detailsObj = scenarioResult.getDetails();
+        if (detailsObj instanceof com.fiserv.fef.models.ScenarioDetails) {
+            ScenarioDetails details = (com.fiserv.fef.models.ScenarioDetails) detailsObj;
+            Document detailsDoc = new Document();
+
+            if (details.getComparisonSourceCount() != null) {
+                detailsDoc.append("comparison_source_count", details.getComparisonSourceCount());
+            }
+            if (details.getComparisonTargetCount() != null) {
+                detailsDoc.append("comparison_target_count", details.getComparisonTargetCount());
+            }
+
+            if (!detailsDoc.isEmpty()) {
+                doc.append("details", detailsDoc);
+            }
+        }
+
+        return doc;
+    }
+
+    /**
+     * Convert StepResult to MongoDB document
+     */
+    private Document convertStepToDocument(StepResult stepResult) {
+        Document doc = new Document()
+                .append("step_text", stepResult.getStepText())
+                .append("passed", stepResult.isPassed());
+
+        // Add error message if present
+        if (stepResult.getErrorMessage() != null) {
+            doc.append("error_message", stepResult.getErrorMessage());
+        }
+
+        return doc;
+    }
+
+    /**
+     * Create indexes for efficient querying
+     */
+    private void createIndexes() {
+        try {
+            // Index on validationID for fast lookups
+            resultsCollection.createIndex(new Document("validationID", 1));
+
+            // Index on pipelineRunID to find all results for a specific run
+            resultsCollection.createIndex(new Document("pipelineRunID", 1));
+
+            // Compound index on processID + validationDate for filtering by business date
+            resultsCollection.createIndex(
+                    new Document("processID", 1).append("validationDate", 1)
+            );
+
+            // Index on created_at for time-based queries
+            resultsCollection.createIndex(new Document("created_at", -1));
+
+            // Compound index on pipelineRunID + validationID for fast individual result lookup
+            resultsCollection.createIndex(
+                    new Document("pipelineRunID", 1).append("validationID", 1)
+            );
+
+            // Compound index on passed + created_at for filtering
+            resultsCollection.createIndex(
+                    new Document("passed", 1).append("created_at", -1)
+            );
+
+            LOG.debug("Indexes created successfully");
+
+        } catch (Exception e) {
+            LOG.warn("Failed to create indexes", e);
+            // Don't fail if index creation fails
+        }
+    }
+
+    /**
+     * Close MongoDB connection
+     */
+    public void close() {
+        if (mongoClient != null) {
+            mongoClient.close();
+        }
+    }
+}
+
