@@ -1,0 +1,191 @@
+package com.fiserv.fef.parquet.filter;
+
+import com.fiserv.fef.utils.Timing;
+import org.apache.parquet.io.api.Binary;
+
+import java.math.BigDecimal;
+import java.math.BigInteger;
+import java.util.*;
+
+/**
+ * DecimalDecodeCache
+ *
+ * - Decodes Parquet DECIMAL values correctly using schema scale
+ * - Uses a bounded LRU cache to avoid repeated BigInteger/BigDecimal creation
+ * - Safe for Parquet 1.13.1
+ * - Restart-safe (cache is in-memory only)
+ */
+public final class DecimalDecodeCache {
+
+    /**
+     * Max number of cached decoded decimal values.
+     * Tune based on cardinality of decimal fields.
+     */
+    private static final int MAX_ENTRIES = 10_000;
+
+    /**
+     * LRU cache: (fieldPath + scale + rawBytes) -> decoded BigDecimal
+     */
+    private static final Map<Key, BigDecimal> CACHE =
+            Collections.synchronizedMap(
+                    new LinkedHashMap<>(256, 0.75f, true) {
+                        @Override
+                        protected boolean removeEldestEntry(Map.Entry<Key, BigDecimal> eldest) {
+                            return size() > MAX_ENTRIES;
+                        }
+                    });
+
+    /**
+     * Per-thread, per-run stats (so Flink parallel tasks don't trample each other).
+     * Call beginRun(topN) at the start of a logical run and endRun() in finally.
+     */
+    private static final ThreadLocal<RunStats> RUN = new ThreadLocal<>();
+
+    private DecimalDecodeCache() {
+        /* utility */
+    }
+
+    /** Begin collecting hit/miss + top-N slow decode stats for the current thread. */
+    public static void beginRun(int topN) {
+        RUN.set(new RunStats(Math.max(1, topN)));
+    }
+
+    /** End stats collection for the current thread and return the snapshot (or null if not active). */
+    public static RunStats endRun() {
+        RunStats s = RUN.get();
+        RUN.remove();
+        return s;
+    }
+
+    /**
+     * Decode a Parquet DECIMAL value with caching.
+     *
+     * @param fieldPath full dot-path (used to isolate cache entries logically)
+     * @param binary    Parquet binary value (FIXED_LEN_BYTE_ARRAY or BINARY)
+     * @param scale     DECIMAL scale from schema
+     * @return decoded BigDecimal value
+     */
+    public static BigDecimal decode(String fieldPath, Binary binary, int scale) {
+
+        if (binary == null) {
+            return null;
+        }
+
+        final RunStats stats = RUN.get();
+        final long t0 = (stats != null) ? Timing.start() : 0L;
+
+        // IMPORTANT: copy bytes defensively (Binary may reuse backing array)
+        byte[] rawBytes = binary.getBytes();
+        byte[] bytesCopy = Arrays.copyOf(rawBytes, rawBytes.length);
+
+        Key key = new Key(fieldPath, scale, bytesCopy);
+
+        BigDecimal cached = CACHE.get(key);
+        if (cached != null) {
+            if (stats != null) {
+                stats.hits++;
+                stats.samples++;
+                stats.consider(fieldPath, scale, bytesCopy.length, true, System.nanoTime() - t0);
+            }
+            return cached;
+        }
+
+        if (stats != null) {
+            stats.misses++;
+        }
+
+        // Decode: unscaled two's-complement integer + scale
+        BigInteger unscaled = new BigInteger(bytesCopy);
+        BigDecimal decoded = new BigDecimal(unscaled, scale);
+
+        CACHE.put(key, decoded);
+
+        if (stats != null) {
+            stats.samples++;
+            stats.consider(fieldPath, scale, bytesCopy.length, false, System.nanoTime() - t0);
+        }
+
+        return decoded;
+    }
+
+    /** Snapshot of per-run stats for the calling thread. */
+    public static final class RunStats {
+        public long hits;
+        public long misses;
+        public long samples;
+
+        private final int topN;
+        private final PriorityQueue<SlowEntry> slowest; // min-heap by nanos
+
+        private RunStats(int topN) {
+            this.topN = topN;
+            this.slowest = new PriorityQueue<>(Comparator.comparingLong(e -> e.elapsedNanos));
+        }
+
+        private void consider(String fieldPath, int scale, int byteLen, boolean hit, long elapsedNanos) {
+            SlowEntry e = new SlowEntry(fieldPath, scale, byteLen, hit, elapsedNanos);
+            if (slowest.size() < topN) {
+                slowest.add(e);
+                return;
+            }
+            SlowEntry smallest = slowest.peek();
+            if (smallest != null && elapsedNanos > smallest.elapsedNanos) {
+                slowest.poll();
+                slowest.add(e);
+            }
+        }
+
+        /** Top-N slow entries (sorted descending by elapsedNanos). */
+        public List<SlowEntry> topSlowest() {
+            ArrayList<SlowEntry> out = new ArrayList<>(slowest);
+            out.sort((a, b) -> Long.compare(b.elapsedNanos, a.elapsedNanos));
+            return out;
+        }
+    }
+
+    /** One slow decode observation. */
+    public static final class SlowEntry {
+        public final String fieldPath;
+        public final int scale;
+        public final int byteLen;
+        public final boolean cacheHit;
+        public final long elapsedNanos;
+
+        private SlowEntry(String fieldPath, int scale, int byteLen, boolean cacheHit, long elapsedNanos) {
+            this.fieldPath = fieldPath;
+            this.scale = scale;
+            this.byteLen = byteLen;
+            this.cacheHit = cacheHit;
+            this.elapsedNanos = elapsedNanos;
+        }
+    }
+
+    /* ------------------------------------------------------------------
+       Cache key
+       ------------------------------------------------------------------ */
+
+    /**
+     * Cache key for DECIMAL decoding.
+     * Includes:
+     * - fieldPath (same raw bytes in different fields may mean different things)
+     * - scale (schema-driven)
+     * - rawBytes (defensive copy)
+     */
+    private record Key(String path, int scale, byte[] bytes) {
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (!(o instanceof Key k)) return false;
+            return scale == k.scale
+                    && path.equals(k.path)
+                    && Arrays.equals(bytes, k.bytes);
+        }
+
+        @Override
+        public int hashCode() {
+            int result = Objects.hash(path, scale);
+            result = 31 * result + Arrays.hashCode(bytes);
+            return result;
+        }
+    }
+}
