@@ -1,0 +1,12 @@
+package com.fiserv.fef.models;
+
+import java.util.List;
+
+public interface ScoreCalculator {
+    /**
+     * Calculates score components for the given input object.
+     * @param input The input object (could be a dataset, scenario, etc.)
+     * @return List of ScoreComponent
+     */
+    List<ScoreComponent> calculate(Object input);
+}
