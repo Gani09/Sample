@@ -1,0 +1,199 @@
+package com.fiserv.fef.datasources;
+
+import com.fiserv.fef.exceptions.DataAccessException;
+import com.fiserv.fef.models.DataQuery;
+import com.fiserv.fef.models.Dataset;
+import org.apache.flink.api.common.functions.MapFunction;
+import org.apache.flink.api.java.DataSet;
+import org.apache.flink.api.java.ExecutionEnvironment;
+import org.bson.Document;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.*;
+
+/**
+ * Flink DataSet data source for distributed processing
+ * Best for: large datasets (> 100k documents), complex joins, aggregations
+ * Performance: Distributed processing across multiple workers
+ *
+ * Note: This implementation provides the interface.
+ * Actual Flink DataSet operations would be executed in Flink job context.
+ */
+public class FlinkDataSetSource implements DataSource {
+
+    private static final Logger LOG = LoggerFactory.getLogger(FlinkDataSetSource.class);
+
+    private final ExecutionEnvironment env;
+    private final int parallelism;
+
+    public FlinkDataSetSource(ExecutionEnvironment env) {
+        this.env = env;
+        this.parallelism = env.getParallelism();
+    }
+
+    public FlinkDataSetSource(ExecutionEnvironment env, int parallelism) {
+        this.env = env;
+        this.parallelism = parallelism;
+    }
+
+    @Override
+    public Dataset load(DataQuery query) {
+        LOG.info("Loading data using Flink DataSet: collection={}, parallelism={}",
+                query.getCollection(), parallelism);
+
+        try {
+            // Create MongoDB input format
+            MongoDBInputFormat inputFormat = new MongoDBInputFormat(
+                    query.getCollection(),
+                    query.getFilter(),
+                    parallelism
+            );
+
+            // Create Flink DataSet
+            DataSet<Document> flinkDataSet = env.createInput(inputFormat);
+
+            // Apply transformations if needed
+            if (query.getProjection() != null && !query.getProjection().isEmpty()) {
+                flinkDataSet = flinkDataSet.map(new ProjectionMapper(query.getProjection()));
+            }
+
+            // Collect results (this triggers execution)
+            List<Document> results = flinkDataSet.collect();
+
+            // Wrap in Dataset
+            Dataset dataset = new Dataset(query.getCollection());
+            dataset.addAll(results);
+
+            LOG.info("Loaded {} documents via Flink", results.size());
+            return dataset;
+
+        } catch (Exception e) {
+            LOG.error("Failed to load data via Flink: collection={}", query.getCollection(), e);
+            throw new DataAccessException(
+                    "Failed to load data via Flink DataSet",
+                    query.getCollection(),
+                    "flink_load",
+                    e
+            );
+        }
+    }
+
+    @Override
+    public long count(DataQuery query) {
+        LOG.info("Counting documents via Flink: collection={}", query.getCollection());
+
+        try {
+            MongoDBInputFormat inputFormat = new MongoDBInputFormat(
+                    query.getCollection(),
+                    query.getFilter(),
+                    parallelism
+            );
+
+            DataSet<Document> flinkDataSet = env.createInput(inputFormat);
+            long count = flinkDataSet.count();
+
+            LOG.info("Count result: {} documents", count);
+            return count;
+
+        } catch (Exception e) {
+            LOG.error("Failed to count via Flink: collection={}", query.getCollection(), e);
+            throw new DataAccessException(
+                    "Failed to count via Flink",
+                    query.getCollection(),
+                    "flink_count",
+                    e
+            );
+        }
+    }
+
+    @Override
+    public Set<Object> distinct(String field, DataQuery query) {
+        LOG.info("Getting distinct values via Flink: collection={}, field={}",
+                query.getCollection(), field);
+
+        try {
+            MongoDBInputFormat inputFormat = new MongoDBInputFormat(
+                    query.getCollection(),
+                    query.getFilter(),
+                    parallelism
+            );
+
+            DataSet<Document> flinkDataSet = env.createInput(inputFormat);
+
+            // Extract field and get distinct
+            DataSet<Object> fieldValues = flinkDataSet
+                    .map((MapFunction<Document, Object>) doc -> doc.get(field))
+                    .filter(value -> value != null);
+
+            List<Object> distinctList = fieldValues.distinct().collect();
+            Set<Object> distinctValues = new HashSet<>(distinctList);
+
+            LOG.info("Found {} distinct values", distinctValues.size());
+            return distinctValues;
+
+        } catch (Exception e) {
+            LOG.error("Failed to get distinct via Flink: collection={}, field={}",
+                    query.getCollection(), field, e);
+            throw new DataAccessException(
+                    "Failed to get distinct via Flink",
+                    query.getCollection(),
+                    "flink_distinct",
+                    e
+            );
+        }
+    }
+
+    @Override
+    public List<Document> aggregate(String collection, List<Document> pipeline) {
+        // Aggregation via Flink would require translating MongoDB pipeline to Flink operations
+        // For simplicity, fall back to MongoDB aggregation
+        LOG.warn("Aggregation via Flink not fully implemented, falling back to MongoDB");
+
+        MongoAggregationSource mongoSource = new MongoAggregationSource();
+        return mongoSource.aggregate(collection, pipeline);
+    }
+
+    @Override
+    public String getSourceType() {
+        return "flink_dataset";
+    }
+
+    /**
+     * Get Flink DataSet for advanced operations
+     * Allows direct access to Flink DataSet API for complex transformations
+     */
+    public DataSet<Document> getFlinkDataSet(DataQuery query) throws Exception {
+        MongoDBInputFormat inputFormat = new MongoDBInputFormat(
+                query.getCollection(),
+                query.getFilter(),
+                parallelism
+        );
+
+        return env.createInput(inputFormat);
+    }
+
+    /**
+     * Projection mapper for Flink
+     */
+    private static class ProjectionMapper implements MapFunction<Document, Document> {
+        private final Document projection;
+
+        public ProjectionMapper(Document projection) {
+            this.projection = projection;
+        }
+
+        @Override
+        public Document map(Document doc) {
+            Document projected = new Document();
+
+            for (String field : projection.keySet()) {
+                if (projection.get(field).equals(1) && doc.containsKey(field)) {
+                    projected.put(field, doc.get(field));
+                }
+            }
+
+            return projected;
+        }
+    }
+}
