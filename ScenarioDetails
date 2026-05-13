@@ -1,0 +1,34 @@
+package com.fiserv.fef.models;
+
+import java.io.Serializable;
+
+/**
+ * Scenario-level details captured from Gherkin execution.
+ *
+ * Intended to hold useful metrics like source/target counts
+ * and match ratios so they are available whether the scenario
+ * passes or fails.
+ */
+public class ScenarioDetails implements Serializable {
+
+    // For list comparison steps (ComparisonSteps.compareListFromSourceToTarget)
+
+    private Integer comparisonSourceCount;
+    private Integer comparisonTargetCount;
+
+    public Integer getComparisonSourceCount() {
+        return comparisonSourceCount;
+    }
+
+    public void setComparisonSourceCount(Integer comparisonSourceCount) {
+        this.comparisonSourceCount = comparisonSourceCount;
+    }
+
+    public Integer getComparisonTargetCount() {
+        return comparisonTargetCount;
+    }
+
+    public void setComparisonTargetCount(Integer comparisonTargetCount) {
+        this.comparisonTargetCount = comparisonTargetCount;
+    }
+}
