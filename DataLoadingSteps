@@ -1,0 +1,679 @@
+package com.fiserv.fef.stepdefs;
+
+import com.fiserv.fef.datasources.DataAccessFactory;
+import com.fiserv.fef.datasources.DataSource;
+import com.fiserv.fef.gherkin.SimpleDataTable;
+import com.fiserv.fef.gherkin.ValidationContext;
+import com.fiserv.fef.models.DataQuery;
+import com.fiserv.fef.models.Dataset;
+import com.fiserv.fef.utils.FilterUtils;
+import com.fiserv.fef.gherkin.annotations.When;
+import org.bson.Document;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.HashSet;
+import java.util.Set;
+import java.util.List;
+
+public class DataLoadingSteps {
+
+    private static final Logger LOG = LoggerFactory.getLogger(DataLoadingSteps.class);
+
+
+    /**
+     * Retrieve distinct values from a collection with flexible filtering (single field)
+     * Example: When I retrieve distinct "accountUuid" from "source" collection "ServicingOrderProcedure" filtered by:
+     *      | filter_key           | condition | filter_value                  | value_type |
+     *      | servicingOrderDate   | eq        | 2025-09-10T05:00:00.000+00:00 | date       |
+     */
+    @When("I retrieve distinct {string} from {string} collection {string} filtered by:")
+    public void retrieveDistinctValuesWithFilters(String fieldName, String contextName, String collection, SimpleDataTable dataTable) {
+        LOG.info("Retrieving distinct values for field '{}' from '{}' collection '{}' with filters", fieldName, contextName, collection);
+
+        ValidationContext context = ValidationContext.getCurrent();
+
+        // Build filter document from data table using FilterUtils
+        Document filterDoc = FilterUtils.buildFilterDocument(dataTable);
+
+        // Build query with filters
+        DataQuery query = new DataQuery(collection);
+        if (!filterDoc.isEmpty()) {
+            query.withFilter(filterDoc);
+        }
+        query.setRequiresAggregation(true);
+
+        // Route to the correct DB based on "source" or "target" keyword
+        DataSource source = DataAccessFactory.getAggregationSource(contextName);
+
+        // Get distinct values
+        Set<Object> distinctValues = source.distinct(fieldName, query);
+
+        // Convert to strings for consistent handling
+        Set<String> stringValues = new HashSet<>();
+        for (Object value : distinctValues) {
+            if (value != null) {
+                stringValues.add(value.toString());
+            }
+        }
+
+        // Store in context with contextName prefix
+        String variableName = contextName + "_" + fieldName.replace(".", "_");
+        context.setVariable(variableName, stringValues);
+        context.setVariable(variableName + "_count", stringValues.size());
+
+        // Also store a simpler count variable for compatibility with count comparison steps
+        // e.g., "source_count" in addition to "source_accountUuid_count"
+        context.setVariable(contextName + "_count", stringValues.size());
+
+        // Log sample values for debugging
+        if (!stringValues.isEmpty()) {
+            String sample = stringValues.stream()
+                    .limit(3)
+                    .reduce((a, b) -> a + ", " + b)
+                    .orElse("");
+            LOG.info("Retrieved {} distinct values for '{}' from '{}' db='{}' (sample: {})",
+                    stringValues.size(), fieldName, collection, contextName, sample);
+        } else {
+            LOG.warn("No values found for field '{}' in collection '{}' db='{}'", fieldName, collection, contextName);
+        }
+    }
+
+    /**
+     * Retrieve multiple fields (as a dataset) from a collection with flexible filtering
+     * Example: When I retrieve "field1, field2, field3" from "source" collection "CollectionA" filtered by:
+     *      | filter_key           | condition | filter_value                  | value_type |
+     *      | servicingOrderDate   | eq        | 2025-09-10T05:00:00.000+00:00 | date       |
+     *      | status              | eq        | active                        | string     |
+     */
+    @When("I retrieve {string} from {string} collection {string} filtered by:")
+    public void retrieveMultipleFieldsWithFilters(String fieldNames, String contextName, String collection, SimpleDataTable dataTable) {
+        LOG.info("Retrieving fields '{}' from '{}' collection '{}' with filters", fieldNames, contextName, collection);
+
+        ValidationContext context = ValidationContext.getCurrent();
+
+        // Parse field names (comma-separated)
+        String[] fields = fieldNames.split(",");
+        java.util.List<String> fieldList = new java.util.ArrayList<>();
+        for (String field : fields) {
+            fieldList.add(field.trim());
+        }
+
+        LOG.info("Parsed {} fields: {}", fieldList.size(), fieldList);
+
+        // Build filter document from data table using FilterUtils
+        Document filterDoc = FilterUtils.buildFilterDocument(dataTable);
+
+        // Build query with filters and projection
+        DataQuery query = new DataQuery(collection);
+        if (!filterDoc.isEmpty()) {
+            query.withFilter(filterDoc);
+        }
+
+        // Add projection for specific fields
+        Document projection = new Document();
+        for (String field : fieldList) {
+            projection.append(field, 1);
+        }
+        // Always include _id unless explicitly excluded
+        query.withProjection(projection);
+
+        LOG.info("Applying projection: {}", projection.toJson());
+
+        // Route to the correct DB based on "source" or "target" keyword
+        DataSource source = DataAccessFactory.getDataSource(query, null, null, contextName);
+
+        // Load data
+        Dataset dataset = source.load(query);
+
+        // Store dataset with contextName
+        context.setDataset(contextName, dataset);
+        context.setVariable(contextName + "_count", dataset.size());
+        context.setVariable(contextName + "_collection", collection);
+        context.setVariable(contextName + "_fields", fieldList);
+        LOG.info("Retrieved {} records with {} fields from '{}' db='{}' and stored as '{}'",
+                dataset.size(), fieldList.size(), collection, contextName, contextName);
+        // Log sample record for debugging
+        if (!dataset.isEmpty()) {
+            LOG.debug("Sample record: {}", dataset.getDocuments().get(0));
+        }
+    }
+
+
+    /**
+     * Retrieve fields from target collection where a field matches values from source collection
+     * Example: When I retrieve "accountUuid, AccountStatus" from "target" collection "Account_Current", where "accountUuid" matches "accountUuid" from source collection
+     *
+     * This loads documents from target collection where the specified match field contains values
+     * that exist in the source collection's corresponding field. No comparison is performed - only data retrieval.
+     *
+     * PERFORMANCE OPTIMIZATION:
+     * - For single field retrieval (e.g., "accountUuid"), uses aggregation with distinct() for maximum performance
+     * - For multiple fields, uses cursor-based loading with projection
+     * - Always uses aggregation when dataset size > 1000 for better performance
+     */
+    @When("I retrieve {string} from {string} collection {string}, where {string} matches {string} from source collection")
+    public void retrieveFromTargetWhereFieldMatchesSource(
+            String fieldNames,
+            String contextName,
+            String targetCollection,
+            String targetMatchField,
+            String sourceMatchField) {
+
+        LOG.info("Retrieving '{}' from '{}' collection '{}' where '{}' matches '{}' from source",
+                fieldNames, contextName, targetCollection, targetMatchField, sourceMatchField);
+
+        ValidationContext context = ValidationContext.getCurrent();
+
+        // Get source values for the match field
+        String sourceFieldVariable = "source_" + sourceMatchField.replace(".", "_");
+        @SuppressWarnings("unchecked")
+        Set<String> sourceValues = (Set<String>) context.getVariable(sourceFieldVariable);
+
+        if (sourceValues == null || sourceValues.isEmpty()) {
+            throw new IllegalStateException("No source values found for field '" + sourceMatchField + "'. " +
+                    "Expected variable: " + sourceFieldVariable + ". " +
+                    "Make sure to load source data first using 'I retrieve distinct' step.");
+        }
+
+        LOG.info("Using {} values from source field '{}' to filter target field '{}'",
+                sourceValues.size(), sourceMatchField, targetMatchField);
+
+        // Parse field names to retrieve (comma-separated)
+        String[] fields = fieldNames.split(",");
+        java.util.List<String> fieldList = new java.util.ArrayList<>();
+        for (String field : fields) {
+            fieldList.add(field.trim());
+        }
+
+        LOG.info("Will retrieve {} fields: {}", fieldList.size(), fieldList);
+
+        // OPTIMIZATION: If only retrieving a single field, use aggregation with distinct() for best performance
+        if (fieldList.size() == 1) {
+            String singleField = fieldList.get(0).trim();
+            LOG.info("Single field retrieval detected, using optimized aggregation path");
+
+            // Build query with $in filter for matching
+            DataQuery query = new DataQuery(targetCollection);
+            java.util.ArrayList<String> valueList = new java.util.ArrayList<>(sourceValues);
+            Document filterDoc = new Document(targetMatchField, new Document("$in", valueList));
+            query.withFilter(filterDoc);
+            query.setRequiresAggregation(true);
+
+            LOG.debug("Applying $in filter on '{}' with {} values", targetMatchField, valueList.size());
+            // Route to the correct DB based on contextName ("source" or "target")
+            DataSource aggSource = DataAccessFactory.getAggregationSource(contextName);
+
+            long startTime = System.currentTimeMillis();
+            Set<Object> distinctValues = aggSource.distinct(singleField, query);
+            long duration = System.currentTimeMillis() - startTime;
+
+            // Convert to strings and create a Dataset for compatibility with comparison steps
+            Set<String> stringValues = new HashSet<>();
+            java.util.List<Document> documents = new java.util.ArrayList<>();
+            for (Object value : distinctValues) {
+                if (value != null) {
+                    String strValue = value.toString();
+                    stringValues.add(strValue);
+                    // Create a document with the single field for Dataset compatibility
+                    documents.add(new Document(singleField, strValue));
+                }
+            }
+
+            // Create a Dataset from the documents
+            Dataset dataset = new Dataset(documents, targetCollection);
+
+            // Store both the Set (for direct access) and Dataset (for comparison steps)
+            String variableName = contextName + "_" + singleField.replace(".", "_");
+            context.setVariable(variableName, stringValues);
+            context.setDataset(contextName, dataset); // Store as dataset for comparison steps
+            context.setVariable(contextName + "_count", stringValues.size());
+            context.setVariable(contextName + "_collection", targetCollection);
+            context.setVariable(contextName + "_fields", fieldList);
+
+            LOG.info("Retrieved {} distinct values for '{}' from '{}' db='{}' using aggregation in {}ms",
+                    stringValues.size(), singleField, targetCollection, contextName, duration);
+            return;
+        }
+
+        // For multiple fields, use cursor-based loading with projection
+        // Build query with $in filter for matching
+        DataQuery query = new DataQuery(targetCollection);
+        java.util.ArrayList<String> valueList = new java.util.ArrayList<>(sourceValues);
+        query.withFilter(new Document(targetMatchField, new Document("$in", valueList)));
+
+        // Add projection for specific fields
+        Document projection = new Document();
+        for (String field : fieldList) {
+            projection.append(field, 1);
+        }
+        // Always include the match field if not already included
+        if (!fieldList.contains(targetMatchField)) {
+            projection.append(targetMatchField, 1);
+        }
+        query.withProjection(projection);
+
+        LOG.info("Applying filter: {} = $in({} values)", targetMatchField, valueList.size());
+        LOG.debug("Applying projection: {}", projection.toJson());
+
+        // For datasets > 1000 values, use aggregation for better performance
+        if (sourceValues.size() > 1000) {
+            LOG.info("Dataset size ({}) > 1000, using aggregation for better performance", sourceValues.size());
+            query.setRequiresAggregation(true);
+        }
+
+        // Route to the correct DB based on contextName ("source" or "target")
+        DataSource source = DataAccessFactory.getDataSource(query, null, null, contextName);
+
+
+        // Load matching data
+        Dataset dataset = source.load(query);
+
+        // Store dataset with contextName
+        context.setDataset(contextName, dataset);
+        context.setVariable(contextName + "_count", dataset.size());
+        context.setVariable(contextName + "_collection", targetCollection);
+        context.setVariable(contextName + "_fields", fieldList);
+
+        LOG.info("Retrieved {} records from '{}' db='{}' stored as '{}'",
+                dataset.size(), targetCollection, contextName, contextName);
+        // Log sample record for debugging
+        if (!dataset.isEmpty()) {
+            LOG.debug("Sample record: {}", dataset.getDocuments().get(0));
+        }
+    }
+
+    /**
+     * Retrieve fields from target collection where a field matches values from source collection
+     * with additional filters applied to the target collection.
+     *
+     * Example: When I retrieve "accountUuid, AccountStatus" from "target" collection "Account_Current",
+     *          where "accountUuid" matches "accountUuid" from source collection and filtered by:
+     *      | filter_key           | condition | filter_value    | value_type |
+     *      | businessProcessDate  | eq        | {$businessDate} | date       |
+     *      | status               | eq        | ACTIVE          | string     |
+     *
+     * This combines the source matching filter with additional filters from the data table.
+     *
+     * PERFORMANCE OPTIMIZATION:
+     * - For single field retrieval, uses aggregation with distinct() for maximum performance
+     * - For multiple fields, uses cursor-based loading with projection
+     * - Always uses aggregation when dataset size > 1000 for better performance
+     */
+    @When("I retrieve {string} from {string} collection {string}, where {string} matches {string} from source collection and filtered by:")
+    public void retrieveFromTargetWhereFieldMatchesSourceWithFilters(
+            String fieldNames,
+            String contextName,
+            String targetCollection,
+            String targetMatchField,
+            String sourceMatchField,
+            SimpleDataTable dataTable) {
+
+        LOG.info("Retrieving '{}' from '{}' collection '{}' where '{}' matches '{}' from source with additional filters",
+                fieldNames, contextName, targetCollection, targetMatchField, sourceMatchField);
+
+        ValidationContext context = ValidationContext.getCurrent();
+
+        // Get source values for the match field
+        String sourceFieldVariable = "source_" + sourceMatchField.replace(".", "_");
+        @SuppressWarnings("unchecked")
+        Set<String> sourceValues = (Set<String>) context.getVariable(sourceFieldVariable);
+
+        if (sourceValues == null || sourceValues.isEmpty()) {
+            throw new IllegalStateException("No source values found for field '" + sourceMatchField + "'. " +
+                    "Expected variable: " + sourceFieldVariable + ". " +
+                    "Make sure to load source data first using 'I retrieve distinct' step.");
+        }
+
+        LOG.info("Using {} values from source field '{}' to filter target field '{}'",
+                sourceValues.size(), sourceMatchField, targetMatchField);
+
+        // Build additional filters from data table
+        Document additionalFilters = FilterUtils.buildFilterDocument(dataTable);
+
+        LOG.info("Additional filters applied: {}", additionalFilters.toJson());
+
+        // Parse field names to retrieve (comma-separated)
+        String[] fields = fieldNames.split(",");
+        java.util.List<String> fieldList = new java.util.ArrayList<>();
+        for (String field : fields) {
+            fieldList.add(field.trim());
+        }
+
+        LOG.info("Will retrieve {} fields: {}", fieldList.size(), fieldList);
+
+        // OPTIMIZATION: If only retrieving a single field, use aggregation with distinct() for best performance
+        if (fieldList.size() == 1) {
+            String singleField = fieldList.get(0).trim();
+            LOG.info("Single field retrieval detected, using optimized aggregation path");
+
+            // Build query with $in filter for matching + additional filters
+            DataQuery query = new DataQuery(targetCollection);
+            java.util.ArrayList<String> valueList = new java.util.ArrayList<>(sourceValues);
+            Document matchFilter = new Document(targetMatchField, new Document("$in", valueList));
+
+            // Combine filters using $and
+            Document combinedFilter;
+            if (!additionalFilters.isEmpty()) {
+                combinedFilter = new Document("$and", java.util.Arrays.asList(matchFilter, additionalFilters));
+                LOG.debug("Applying combined filter: {} = $in({} values) AND {}",
+                        targetMatchField, valueList.size(), additionalFilters.toJson());
+            } else {
+                combinedFilter = matchFilter;
+                LOG.debug("Applying $in filter on '{}' with {} values", targetMatchField, valueList.size());
+            }
+
+            query.withFilter(combinedFilter);
+            query.setRequiresAggregation(true);
+
+            // Use aggregation source for distinct values
+            DataSource aggSource = DataAccessFactory.getAggregationSource();
+
+            long startTime = System.currentTimeMillis();
+            Set<Object> distinctValues = aggSource.distinct(singleField, query);
+            long duration = System.currentTimeMillis() - startTime;
+
+            // Convert to strings and create a Dataset for compatibility with comparison steps
+            Set<String> stringValues = new HashSet<>();
+            java.util.List<Document> documents = new java.util.ArrayList<>();
+            for (Object value : distinctValues) {
+                if (value != null) {
+                    String strValue = value.toString();
+                    stringValues.add(strValue);
+                    // Create a document with the single field for Dataset compatibility
+                    documents.add(new Document(singleField, strValue));
+                }
+            }
+
+            // Create a Dataset from the documents
+            Dataset dataset = new Dataset(documents, targetCollection);
+
+            // Store both the Set (for direct access) and Dataset (for comparison steps)
+            String variableName = contextName + "_" + singleField.replace(".", "_");
+            context.setVariable(variableName, stringValues);
+            context.setDataset(contextName, dataset); // Store as dataset for comparison steps
+            context.setVariable(contextName + "_count", stringValues.size());
+            context.setVariable(contextName + "_collection", targetCollection);
+            context.setVariable(contextName + "_fields", fieldList);
+
+            LOG.info("Retrieved {} distinct values for '{}' from '{}' using aggregation with filters in {}ms",
+                    stringValues.size(), singleField, targetCollection, duration);
+
+            return;
+        }
+
+        // For multiple fields, use cursor-based loading with projection
+        // Build query with $in filter for matching + additional filters
+        DataQuery query = new DataQuery(targetCollection);
+        java.util.ArrayList<String> valueList = new java.util.ArrayList<>(sourceValues);
+        Document matchFilter = new Document(targetMatchField, new Document("$in", valueList));
+
+        // Combine filters using $and
+        Document combinedFilter;
+        if (!additionalFilters.isEmpty()) {
+            combinedFilter = new Document("$and", java.util.Arrays.asList(matchFilter, additionalFilters));
+            LOG.info("Applying combined filter: {} = $in({} values) AND {}",
+                    targetMatchField, valueList.size(), additionalFilters.toJson());
+        } else {
+            combinedFilter = matchFilter;
+            LOG.info("Applying filter: {} = $in({} values)", targetMatchField, valueList.size());
+        }
+
+        query.withFilter(combinedFilter);
+
+        // Add projection for specific fields
+        Document projection = new Document();
+        for (String field : fieldList) {
+            projection.append(field, 1);
+        }
+        // Always include the match field if not already included
+        if (!fieldList.contains(targetMatchField)) {
+            projection.append(targetMatchField, 1);
+        }
+        query.withProjection(projection);
+
+        LOG.debug("Applying projection: {}", projection.toJson());
+
+        // For datasets > 1000 values, use aggregation for better performance
+        if (sourceValues.size() > 1000) {
+            LOG.info("Dataset size ({}) > 1000, using aggregation for better performance", sourceValues.size());
+            query.setRequiresAggregation(true);
+        }
+
+        // Get data source (will auto-select aggregation or cursor based on query settings)
+        DataSource source = DataAccessFactory.getDataSource(query);
+
+        // Load matching data
+        Dataset dataset = source.load(query);
+
+        // Store dataset with contextName
+        context.setDataset(contextName, dataset);
+        context.setVariable(contextName + "_count", dataset.size());
+        context.setVariable(contextName + "_collection", targetCollection);
+        context.setVariable(contextName + "_fields", fieldList);
+
+        LOG.info("Retrieved {} records from '{}' with filters and stored as '{}'", dataset.size(), targetCollection, contextName);
+
+        // Log sample record for debugging
+        if (!dataset.isEmpty()) {
+            LOG.debug("Sample record: {}", dataset.getDocuments().get(0));
+        }
+    }
+
+    /**
+     * Optimized step for matching records between source and target collections using aggregation
+     * This performs a single aggregation query with $lookup for better performance on large datasets
+     *
+     * Example: When I retrieve matching "accountUuid" records from "source" collection "ServicingOrderProcedure"
+     *          and "target" collection "Account_Current" filtered by:
+     *      | filter_key           | condition | filter_value     | value_type |
+     *      | servicingOrderDate   | eq        | {$businessDate}  | date       |
+     *
+     * This step:
+     * 1. Filters source collection
+     * 2. Gets distinct match field values
+     * 3. Uses aggregation to find matching records in target
+     * All in a single optimized operation.
+     */
+    @When("I retrieve matching {string} records from {string} collection {string} and {string} collection {string} filtered by:")
+    public void retrieveMatchingRecordsOptimized(
+            String matchField,
+            String sourceContext,
+            String sourceCollection,
+            String targetContext,
+            String targetCollection,
+            SimpleDataTable dataTable) {
+
+        LOG.info("Retrieving matching '{}' records from source '{}' and target '{}' with optimized aggregation",
+                matchField, sourceCollection, targetCollection);
+
+        long startTime = System.currentTimeMillis();
+        ValidationContext context = ValidationContext.getCurrent();
+
+        // Build filter document from data table
+        Document filterDoc = FilterUtils.buildFilterDocument(dataTable);
+
+        // Step 1: Get distinct values from source using aggregation
+        DataQuery sourceQuery = new DataQuery(sourceCollection);
+        if (!filterDoc.isEmpty()) {
+            sourceQuery.withFilter(filterDoc);
+        }
+        sourceQuery.setRequiresAggregation(true);
+
+        // Route source query to source DB
+        DataSource aggSource = DataAccessFactory.getAggregationSource(sourceContext);
+        Set<Object> distinctValues = aggSource.distinct(matchField, sourceQuery);
+
+        // Convert to strings
+        Set<String> stringValues = new HashSet<>();
+        for (Object value : distinctValues) {
+            if (value != null) {
+                stringValues.add(value.toString());
+            }
+        }
+
+        LOG.info("Found {} distinct '{}' values in source collection '{}'",
+                stringValues.size(), matchField, sourceCollection);
+
+        // Store source values
+        String sourceVar = sourceContext + "_" + matchField.replace(".", "_");
+        context.setVariable(sourceVar, stringValues);
+        context.setVariable(sourceVar + "_count", stringValues.size());
+
+        // Step 2: Get matching records from target using aggregation (much faster than cursor for large $in)
+        DataQuery targetQuery = new DataQuery(targetCollection);
+        java.util.ArrayList<String> valueList = new java.util.ArrayList<>(stringValues);
+        targetQuery.withFilter(new Document(matchField, new Document("$in", valueList)));
+        targetQuery.withProjection(new Document(matchField, 1));
+        targetQuery.setRequiresAggregation(true); // Force aggregation for performance
+
+        LOG.info("Querying target collection '{}' with {} values using aggregation", targetCollection, valueList.size());
+
+        DataSource targetSource = DataAccessFactory.getAggregationSource(targetContext);
+        Dataset targetDataset = targetSource.load(targetQuery);
+
+        // Store target dataset
+        context.setDataset(targetContext, targetDataset);
+        context.setVariable(targetContext + "_count", targetDataset.size());
+        context.setVariable(targetContext + "_collection", targetCollection);
+        context.setVariable(targetContext + "_fields", java.util.Arrays.asList(matchField));
+
+        long duration = System.currentTimeMillis() - startTime;
+        LOG.info("Retrieved {} source values and {} target records in {}ms",
+                stringValues.size(), targetDataset.size(), duration);
+    }
+
+    /**
+     * Retrieve count of records from target collection where a field matches values from source collection
+     * This is optimized for count-only queries and doesn't load actual documents.
+     *
+     * Example: When I retrieve count of "target" records from "FinancialAdjustmentRequest" collection,
+     *          where "accountUuid" matches "accountUuid" from source collection
+     *
+     * This is much faster than loading all documents when you only need the count.
+     */
+    @When("I retrieve count of {string} records from {string} collection, where {string} matches {string} from source collection")
+    public void retrieveCountFromTargetWhereFieldMatchesSource(
+            String contextName,
+            String targetCollection,
+            String targetMatchField,
+            String sourceMatchField) {
+
+        LOG.info("Retrieving count from '{}' collection '{}' where '{}' matches '{}' from source",
+                contextName, targetCollection, targetMatchField, sourceMatchField);
+
+        ValidationContext context = ValidationContext.getCurrent();
+
+        // Get source values for the match field
+        String sourceFieldVariable = "source_" + sourceMatchField.replace(".", "_");
+        @SuppressWarnings("unchecked")
+        Set<String> sourceValues = (Set<String>) context.getVariable(sourceFieldVariable);
+
+        if (sourceValues == null || sourceValues.isEmpty()) {
+            throw new IllegalStateException("No source values found for field '" + sourceMatchField + "'. " +
+                    "Expected variable: " + sourceFieldVariable + ". " +
+                    "Make sure to load source data first using 'I retrieve distinct' step.");
+        }
+
+        LOG.info("Using {} values from source field '{}' to count records in target",
+                sourceValues.size(), sourceMatchField);
+
+        // Build query with $in filter for matching - use aggregation for count performance
+        DataQuery query = new DataQuery(targetCollection);
+        java.util.ArrayList<String> valueList = new java.util.ArrayList<>(sourceValues);
+        query.withFilter(new Document(targetMatchField, new Document("$in", valueList)));
+        query.setRequiresAggregation(true); // Use aggregation for better performance
+
+        // Route to the correct DB based on contextName
+        DataSource aggSource = DataAccessFactory.getAggregationSource(contextName);
+        // Use count operation (much faster than loading all documents)
+        long startTime = System.currentTimeMillis();
+        long recordCount = aggSource.count(query);
+        long duration = System.currentTimeMillis() - startTime;
+
+        // Store count with contextName prefix
+        context.setVariable(contextName + "_count", (int) recordCount);
+        context.setVariable(contextName + "_collection", targetCollection);
+
+        LOG.info("Found {} records in '{}' db='{}' matching {} source values in {}ms",
+                recordCount, targetCollection, contextName, sourceValues.size(), duration);
+    }
+
+    /**
+     * Retrieve count of records from target collection where a field matches values from source collection
+     * with additional filters applied.
+     *
+     * Example: When I retrieve count of "target" records from "FinancialAdjustmentRequest" collection,
+     *          where "accountUuid" matches "accountUuid" from source collection and filtered by:
+     *      | filter_key           | condition | filter_value    | value_type |
+     *      | businessProcessDate  | eq        | {$businessDate} | date       |
+     *
+     * This combines the matching filter with additional filters from the data table.
+     * Optimized for count-only queries - doesn't load actual documents.
+     */
+    @When("I retrieve count of {string} records from {string} collection, where {string} matches {string} from source collection and filtered by:")
+    public void retrieveCountFromTargetWhereFieldMatchesSourceWithFilters(
+            String contextName,
+            String targetCollection,
+            String targetMatchField,
+            String sourceMatchField,
+            SimpleDataTable dataTable) {
+
+        LOG.info("Retrieving count from '{}' collection '{}' where '{}' matches '{}' from source with additional filters",
+                contextName, targetCollection, targetMatchField, sourceMatchField);
+
+        ValidationContext context = ValidationContext.getCurrent();
+
+        // Get source values for the match field
+        String sourceFieldVariable = "source_" + sourceMatchField.replace(".", "_");
+        @SuppressWarnings("unchecked")
+        Set<String> sourceValues = (Set<String>) context.getVariable(sourceFieldVariable);
+
+        if (sourceValues == null || sourceValues.isEmpty()) {
+            throw new IllegalStateException("No source values found for field '" + sourceMatchField + "'. " +
+                    "Expected variable: " + sourceFieldVariable + ". " +
+                    "Make sure to load source data first using 'I retrieve distinct' step.");
+        }
+
+        LOG.info("Using {} values from source field '{}' to count records in target",
+                sourceValues.size(), sourceMatchField);
+
+        // Build additional filters from data table
+        Document additionalFilters = FilterUtils.buildFilterDocument(dataTable);
+
+        // Build combined filter: $in filter + additional filters
+        DataQuery query = new DataQuery(targetCollection);
+        java.util.ArrayList<String> valueList = new java.util.ArrayList<>(sourceValues);
+
+        // Create combined filter using $and
+        Document matchFilter = new Document(targetMatchField, new Document("$in", valueList));
+
+        Document combinedFilter;
+        if (!additionalFilters.isEmpty()) {
+            combinedFilter = new Document("$and", java.util.Arrays.asList(matchFilter, additionalFilters));
+            LOG.info("Applying combined filter: {} = $in({} values) AND {}",
+                    targetMatchField, valueList.size(), additionalFilters.toJson());
+        } else {
+            combinedFilter = matchFilter;
+            LOG.info("Applying filter: {} = $in({} values)", targetMatchField, valueList.size());
+        }
+
+        query.withFilter(combinedFilter);
+        query.setRequiresAggregation(true); // Use aggregation for better performance
+
+        // Get aggregation source for counting
+        DataSource aggSource = DataAccessFactory.getAggregationSource();
+
+        // Use count operation (much faster than loading all documents)
+        long startTime = System.currentTimeMillis();
+        long recordCount = aggSource.count(query);
+        long duration = System.currentTimeMillis() - startTime;
+
+        // Store count with contextName prefix
+        context.setVariable(contextName + "_count", (int) recordCount);
+        context.setVariable(contextName + "_collection", targetCollection);
+
+        LOG.info("Found {} records in '{}' db='{}' matching {} source values with additional filters in {}ms",
+                recordCount, targetCollection, contextName, sourceValues.size(), duration);
+    }
+}
