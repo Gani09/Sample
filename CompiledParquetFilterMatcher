@@ -1,0 +1,57 @@
+package com.fiserv.fef.parquet.filter;
+
+import com.fiserv.fef.parquet.validation.ParquetGroupValueExtractor;
+import org.apache.parquet.example.data.Group;
+
+import java.math.BigDecimal;
+
+/**
+ * Evaluates FilterSpec against a Parquet Group.
+ *
+ * record.match.anywhere=true:
+ *  - if spec.resolvedPaths contains multiple paths, predicate succeeds if ANY path matches.
+ *
+ * record.match.anywhere=false:
+ *  - spec.resolvedPaths will contain exactly one explicit path.
+ */
+public final class CompiledParquetFilterMatcher {
+
+    private CompiledParquetFilterMatcher() {}
+
+    public static boolean matches(Group group, FilterSpec spec) {
+        if (group == null || spec == null) return false;
+
+        // OR across candidate paths when any-where matching is enabled for short keys
+        for (String path : spec.resolvedPaths) {
+            Object actual = ParquetGroupValueExtractor.getValue(group, path);
+            if (actual == null) {
+                continue;
+            }
+            if (equalsTyped(actual, spec.expectedTyped, spec.expectedRaw)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static boolean equalsTyped(Object actual, Object expectedTyped, String expectedRaw) {
+        if (actual == null) return expectedRaw == null;
+
+        // BigDecimal compare
+        if (actual instanceof BigDecimal aDec) {
+            if (expectedTyped instanceof BigDecimal eDec) {
+                return aDec.compareTo(eDec) == 0;
+            }
+            // fallback to string
+            return aDec.toPlainString().equals(expectedRaw);
+        }
+
+        // Default: string compare
+        String a = String.valueOf(actual);
+        if (expectedTyped != null && !(expectedTyped instanceof String)) {
+            return a.equals(String.valueOf(expectedTyped));
+        }
+        return expectedRaw == null ? actual == null : a.equals(expectedRaw);
+    }
+}
