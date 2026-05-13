@@ -1,0 +1,34 @@
+package com.fiserv.fef.models;
+
+import java.io.Serializable;
+
+/**
+ * Performance tuning configuration
+ */
+public class PerformanceConfig implements Serializable {
+    
+    private String strategy;      // in_memory, batch, distributed, aggregation
+    private Integer batchSize;
+    private Integer parallelism;
+    private Integer timeoutSeconds;
+    
+    public PerformanceConfig() {
+        this.strategy = "auto";
+        this.batchSize = 10000;
+        this.parallelism = 4;
+        this.timeoutSeconds = 300;
+    }
+    
+    // Getters and Setters
+    public String getStrategy() { return strategy; }
+    public void setStrategy(String strategy) { this.strategy = strategy; }
+    
+    public Integer getBatchSize() { return batchSize; }
+    public void setBatchSize(Integer batchSize) { this.batchSize = batchSize; }
+    
+    public Integer getParallelism() { return parallelism; }
+    public void setParallelism(Integer parallelism) { this.parallelism = parallelism; }
+    
+    public Integer getTimeoutSeconds() { return timeoutSeconds; }
+    public void setTimeoutSeconds(Integer timeoutSeconds) { this.timeoutSeconds = timeoutSeconds; }
+}
