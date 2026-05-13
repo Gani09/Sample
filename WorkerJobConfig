@@ -1,0 +1,81 @@
+package com.fiserv.fef.jobs;
+
+import java.io.Serializable;
+
+/**
+ * Configuration for Worker Validation Job
+ */
+public class WorkerJobConfig implements Serializable {
+
+    private String validationID;
+    private String processID;
+    private String pipelineRunID;
+    private String validationDate;
+    private String featureID;
+    private String mongoUri;
+    private String mongoDatabase;        // SEP data database
+    private String mongoFefDatabase;     // FEF collections database
+    private String resultsCollection;
+    private String featuresCollection;
+    private String jobName;
+    private String sourceDbName;
+    private String targetDbName;
+
+
+    public WorkerJobConfig() {
+        // Default values will be set by JobConfig
+    }
+
+    // Getters and Setters
+    public String getValidationID() { return validationID; }
+    public void setValidationID(String validationID) { this.validationID = validationID; }
+
+    public String getProcessID() { return processID; }
+    public void setProcessID(String processID) { this.processID = processID; }
+
+    public String getPipelineRunID() { return pipelineRunID; }
+    public void setPipelineRunID(String pipelineRunID) { this.pipelineRunID = pipelineRunID; }
+
+    public String getValidationDate() { return validationDate; }
+    public void setValidationDate(String validationDate) { this.validationDate = validationDate; }
+
+    public String getFeatureID() { return featureID; }
+    public void setFeatureID(String featureID) { this.featureID = featureID; }
+
+    public String getMongoUri() { return mongoUri; }
+    public void setMongoUri(String mongoUri) { this.mongoUri = mongoUri; }
+
+    public String getMongoDatabase() { return mongoDatabase; }
+    public void setMongoDatabase(String mongoDatabase) { this.mongoDatabase = mongoDatabase; }
+
+    public String getMongoFefDatabase() { return mongoFefDatabase; }
+    public void setMongoFefDatabase(String mongoFefDatabase) { this.mongoFefDatabase = mongoFefDatabase; }
+
+    public String getResultsCollection() { return resultsCollection; }
+    public void setResultsCollection(String resultsCollection) { this.resultsCollection = resultsCollection; }
+
+    public String getFeaturesCollection() { return featuresCollection; }
+    public void setFeaturesCollection(String featuresCollection) { this.featuresCollection = featuresCollection; }
+
+    public String getJobName() { return jobName; }
+    public void setJobName(String jobName) { this.jobName = jobName; }
+
+    public String getSourceDbName() { return sourceDbName; }
+    public void setSourceDbName(String sourceDbName) { this.sourceDbName = sourceDbName; }
+
+    public String getTargetDbName() { return targetDbName; }
+    public void setTargetDbName(String targetDbName) { this.targetDbName = targetDbName; }
+
+    @Override
+    public String toString() {
+        return "WorkerJobConfig{" +
+                "validationID='" + validationID + '\'' +
+                ", processID='" + processID + '\'' +
+                ", pipelineRunID='" + pipelineRunID + '\'' +
+                ", validationDate='" + validationDate + '\'' +
+                ", featureID='" + featureID + '\'' +
+                ", mongoDatabase='" + mongoDatabase + '\'' +
+                ", mongoFefDatabase='" + mongoFefDatabase + '\'' +
+                '}';
+    }
+}
