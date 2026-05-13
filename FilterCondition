@@ -1,0 +1,58 @@
+package com.fiserv.fef.parquet.filter;
+
+import java.util.Objects;
+import java.util.Optional;
+
+public final class FilterCondition {
+    private final String key;
+    private final Operator operator;
+    private final Object value;
+
+    private FilterCondition(String k, Operator o, Object v) {
+        this.key = k;
+        this.operator = o;
+        this.value = v;
+    }
+
+    public static FilterCondition of(String k, Operator o, Object v) {
+        return new FilterCondition(k, o, v);
+    }
+
+    public static FilterCondition joinKeyOnly(String k) {
+        return new FilterCondition(k, Operator.NONE, null);
+    }
+
+    public String getKey() {
+        return key;
+    }
+
+    public Operator getOperator() {
+        return operator;
+    }
+
+    public Optional<Object> getValue() {
+        return Optional.ofNullable(value);
+    }
+
+    @Override
+    public boolean equals(Object other) {
+        if (this == other) return true;
+        if (!(other instanceof FilterCondition)) return false;
+        FilterCondition o = (FilterCondition) other;
+        return Objects.equals(key, o.key) && operator == o.operator && Objects.equals(value, o.value);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(key, operator, value);
+    }
+
+    @Override
+    public String toString() {
+        return "FilterCondition{" +
+                "key='" + key + '\'' +
+                ", operator=" + operator +
+                ", value=" + value +
+                '}';
+    }
+}
