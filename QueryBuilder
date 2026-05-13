@@ -1,0 +1,150 @@
+package com.fiserv.fef.utils;
+
+import com.fiserv.fef.models.DataQuery;
+import org.bson.Document;
+import org.bson.conversions.Bson;
+import com.mongodb.client.model.Filters;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Helper class to build MongoDB queries from various inputs
+ */
+public class QueryBuilder {
+
+    /**
+     * Build query from condition string and parameters
+     * Example: buildQuery("collection", "servicingOrderDate = ${date}")
+     */
+    public static DataQuery build(String collection, String condition, Map<String, Object> parameters) {
+        DataQuery query = new DataQuery(collection);
+
+        // Parse condition and build filter
+        Document filter = parseCondition(condition, parameters);
+        query.setFilter(filter);
+        query.setParameters(parameters);
+
+        return query;
+    }
+
+    /**
+     * Build simple equality filter
+     */
+    public static DataQuery buildEquals(String collection, String field, Object value) {
+        DataQuery query = new DataQuery(collection);
+        query.setFilter(new Document(field, value));
+        return query;
+    }
+
+    /**
+     * Build IN filter for checking if field value is in a set
+     */
+    public static DataQuery buildIn(String collection, String field, List<?> values) {
+        DataQuery query = new DataQuery(collection);
+        query.setFilter(new Document(field, new Document("$in", values)));
+        return query;
+    }
+
+    /**
+     * Build query for distinct values
+     */
+    public static DataQuery buildDistinct(String collection, String field, Document filter) {
+        DataQuery query = new DataQuery(collection);
+        query.setFilter(filter != null ? filter : new Document());
+        query.setRequiresAggregation(true);
+        return query;
+    }
+
+    /**
+     * Build query for count
+     */
+    public static DataQuery buildCount(String collection, Document filter) {
+        DataQuery query = new DataQuery(collection);
+        query.setFilter(filter != null ? filter : new Document());
+        query.setRequiresAggregation(true);
+        return query;
+    }
+
+    /**
+     * Parse condition string into MongoDB filter document
+     * Supports simple conditions like:
+     * - "field = value"
+     * - "field = ${param}"
+     * - "field IN (value1, value2)"
+     */
+    private static Document parseCondition(String condition, Map<String, Object> parameters) {
+        if (condition == null || condition.trim().isEmpty()) {
+            return new Document();
+        }
+
+        Document filter = new Document();
+
+        // Simple implementation - can be extended for complex queries
+        condition = condition.trim();
+
+        // Handle equals
+        if (condition.contains("=")) {
+            String[] parts = condition.split("=", 2);
+            String field = parts[0].trim();
+            String value = parts[1].trim();
+
+            // Check if value is a parameter reference
+            if (value.startsWith("${") && value.endsWith("}")) {
+                String paramName = value.substring(2, value.length() - 1);
+                Object paramValue = parameters.get(paramName);
+                filter.append(field, paramValue);
+            } else {
+                // Remove quotes if present
+                value = value.replaceAll("^['\"]|['\"]$", "");
+                filter.append(field, value);
+            }
+        }
+
+        return filter;
+    }
+
+    /**
+     * Build aggregation pipeline for distinct values
+     * Optimized for large datasets by grouping directly on the field
+     */
+    public static List<Document> buildDistinctPipeline(String field, Document matchFilter) {
+        List<Document> pipeline = new ArrayList<>();
+
+        // Add match stage first if filter exists - this allows index usage
+        if (matchFilter != null && !matchFilter.isEmpty()) {
+            pipeline.add(new Document("$match", matchFilter));
+        }
+
+        // Group by the field directly (more efficient than $addToSet for large datasets)
+        // This creates a document for each unique value
+        pipeline.add(new Document("$group", new Document("_id", "$" + field)));
+
+        // Collect all unique values into an array
+        pipeline.add(new Document("$group",
+            new Document("_id", null)
+                .append("values", new Document("$addToSet", "$_id"))));
+
+        // Project to remove the _id field
+        pipeline.add(new Document("$project", new Document("_id", 0)
+                .append("values", 1)));
+
+        return pipeline;
+    }
+
+    /**
+     * Build aggregation pipeline for count
+     */
+    public static List<Document> buildCountPipeline(Document matchFilter) {
+        List<Document> pipeline = new ArrayList<>();
+
+        if (matchFilter != null && !matchFilter.isEmpty()) {
+            pipeline.add(new Document("$match", matchFilter));
+        }
+
+        pipeline.add(new Document("$count", "total"));
+
+        return pipeline;
+    }
+}
