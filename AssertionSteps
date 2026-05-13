@@ -1,0 +1,415 @@
+package com.fiserv.fef.stepdefs;
+
+import com.fiserv.fef.gherkin.ValidationContext;
+import com.fiserv.fef.gherkin.annotations.Then;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
+
+/**
+ * Step definitions for assertions and validations
+ */
+public class AssertionSteps {
+
+    private static final Logger LOG = LoggerFactory.getLogger(AssertionSteps.class);
+
+    /**
+     * Assert all source accountUuids exist in target
+     * Example: Then all source accountUuids should exist in the target collection
+     */
+    @Then("all source accountUuids should exist in the target collection")
+    public void allSourceAccountUuidsShouldExistInTarget() {
+        LOG.info("Asserting all source accountUuids exist in target");
+
+        ValidationContext context = ValidationContext.getCurrent();
+
+        @SuppressWarnings("unchecked")
+        Set<Object> missingUuids = (Set<Object>) context.getVariable("missing_account_uuids");
+
+        if (missingUuids == null) {
+            throw new IllegalStateException("Missing accountUuids not calculated. Run 'check accountUuids' first.");
+        }
+
+        if (!missingUuids.isEmpty()) {
+            String message = String.format(
+                    "Validation failed: %d accountUuids missing from target collection. First 10: %s",
+                    missingUuids.size(),
+                    getFirstN(missingUuids, 10)
+            );
+            LOG.error(message);
+            throw new AssertionError(message);
+        }
+
+        LOG.info("Assertion passed: All accountUuids exist in target");
+    }
+
+    /**
+     * Assert record count matches expected value
+     * Example: Then record count should be 50000
+     */
+    @Then("record count should be {int}")
+    public void recordCountShouldBe(int expectedCount) {
+        LOG.info("Asserting record count equals: {}", expectedCount);
+
+        ValidationContext context = ValidationContext.getCurrent();
+        Long actualCount = context.getVariable("record_count", Long.class);
+
+        if (actualCount == null) {
+            throw new IllegalStateException("Record count not calculated");
+        }
+
+        if (actualCount != expectedCount) {
+            String message = String.format(
+                    "Record count mismatch: expected %d, actual %d",
+                    expectedCount, actualCount
+            );
+            LOG.error(message);
+            throw new AssertionError(message);
+        }
+
+        LOG.info("Assertion passed: Record count = {}", actualCount);
+    }
+
+    /**
+     * Assert counts match between datasets
+     * Example: Then counts should match between source and target
+     */
+    @Then("counts should match between source and target")
+    public void countsShouldMatchBetweenSourceAndTarget() {
+        LOG.info("Asserting counts match");
+
+        ValidationContext context = ValidationContext.getCurrent();
+        Boolean countsMatch = context.getVariable("counts_match", Boolean.class);
+
+        if (countsMatch == null) {
+            throw new IllegalStateException("Counts not compared");
+        }
+
+        if (!countsMatch) {
+            Integer count1 = context.getVariable("count_1", Integer.class);
+            Integer count2 = context.getVariable("count_2", Integer.class);
+
+            String message = String.format(
+                    "Count mismatch: source=%d, target=%d",
+                    count1, count2
+            );
+            LOG.error(message);
+            throw new AssertionError(message);
+        }
+
+        LOG.info("Assertion passed: Counts match");
+    }
+
+    /**
+     * Assert sum equals expected value
+     * Example: Then sum should be 1000000.50
+     */
+    @Then("sum should be {double}")
+    public void sumShouldBe(double expectedSum) {
+        LOG.info("Asserting sum equals: {}", expectedSum);
+
+        ValidationContext context = ValidationContext.getCurrent();
+        Double actualSum = context.getVariable("calculated_sum", Double.class);
+
+        if (actualSum == null) {
+            throw new IllegalStateException("Sum not calculated");
+        }
+
+        // Allow small floating point difference
+        double difference = Math.abs(actualSum - expectedSum);
+        if (difference > 0.01) {
+            String message = String.format(
+                    "Sum mismatch: expected %.2f, actual %.2f",
+                    expectedSum, actualSum
+            );
+            LOG.error(message);
+            throw new AssertionError(message);
+        }
+
+        LOG.info("Assertion passed: Sum = {}", actualSum);
+    }
+
+
+
+    /**
+     * Assert value is greater than threshold
+     * Example: Then record count should be greater than 1000
+     */
+    @Then("record count should be greater than {int}")
+    public void recordCountShouldBeGreaterThan(int threshold) {
+        LOG.info("Asserting record count > {}", threshold);
+
+        ValidationContext context = ValidationContext.getCurrent();
+        Long actualCount = context.getVariable("record_count", Long.class);
+
+        if (actualCount == null) {
+            throw new IllegalStateException("Record count not calculated");
+        }
+
+        if (actualCount <= threshold) {
+            String message = String.format(
+                    "Record count too low: expected > %d, actual %d",
+                    threshold, actualCount
+            );
+            LOG.error(message);
+            throw new AssertionError(message);
+        }
+
+        LOG.info("Assertion passed: Record count {} > {}", actualCount, threshold);
+    }
+
+    /**
+     * Assert value is less than threshold
+     * Example: Then missing count should be less than 10
+     */
+    @Then("missing count should be less than {int}")
+    public void missingCountShouldBeLessThan(int threshold) {
+        LOG.info("Asserting missing count < {}", threshold);
+
+        ValidationContext context = ValidationContext.getCurrent();
+        Integer missingCount = context.getVariable("missing_count", Integer.class);
+
+        if (missingCount == null) {
+            throw new IllegalStateException("Missing count not calculated");
+        }
+
+        if (missingCount >= threshold) {
+            String message = String.format(
+                    "Too many missing records: expected < %d, actual %d",
+                    threshold, missingCount
+            );
+            LOG.error(message);
+            throw new AssertionError(message);
+        }
+
+        LOG.info("Assertion passed: Missing count {} < {}", missingCount, threshold);
+    }
+
+    /**
+     * Assert values match between source and target lists with percentage threshold
+     * This is a more explicit step that clearly states source/target comparison.
+     *
+     * Example: Then values from both source and target lists should match 100.0%
+     *
+     * Expects that comparison step has been run first. Uses comparison results from context.
+     * The percentage can be a decimal (e.g., 99.5, 100.0)
+     */
+    @Then("values from both source and target lists should match {double}%")
+    public void valuesFromBothSourceAndTargetListsShouldMatch(double expectedPercentage) {
+        LOG.info("Asserting values match between source and target with {}% threshold", expectedPercentage);
+
+        ValidationContext context = ValidationContext.getCurrent();
+
+        // Get comparison results that were set by the comparison step
+        Integer sourceCount = context.getVariable("comparison_source_count", Integer.class);
+        Integer targetCount = context.getVariable("comparison_target_count", Integer.class);
+        Integer foundCount = context.getVariable("comparison_found_count", Integer.class);
+        Integer missingCount = context.getVariable("comparison_missing_count", Integer.class);
+        Double matchRate = context.getVariable("comparison_match_rate", Double.class);
+
+        if (sourceCount == null || matchRate == null) {
+            throw new IllegalStateException("Comparison results not found in context. " +
+                    "Make sure to run the comparison step first: " +
+                    "'When I compare \"field\" list from source collection to \"field\" list from target collection'");
+        }
+
+        LOG.info("Match details from comparison: source_count={}, target_count={}, found={}, missing={}, match_rate={}%",
+                sourceCount, targetCount, foundCount, missingCount, String.format("%.2f", matchRate));
+
+        if (matchRate < expectedPercentage) {
+            // Get missing values for detailed reporting
+            @SuppressWarnings("unchecked")
+            Set<String> missingValues = (Set<String>) context.getVariable("comparison_missing_values");
+
+            String message = String.format(
+                    "Match rate too low: expected >= %.2f%%, actual %.2f%%. " +
+                    "Source count: %d, Target count: %d, Matching: %d, Missing: %d. " +
+                    "First 10 missing values: %s",
+                    expectedPercentage, matchRate,
+                    sourceCount, targetCount, foundCount, missingCount,
+                    missingValues != null ? getFirstN(missingValues, 10) : "N/A"
+            );
+            LOG.error(message);
+            throw new AssertionError(message);
+        }
+
+        LOG.info("Assertion passed: Match rate {}% >= {}%",
+                String.format("%.2f", matchRate), String.format("%.2f", expectedPercentage));
+    }
+
+    /**
+     * Assert specific field values match
+     * Example: Then field "status" should be "completed" in all records
+     */
+    @Then("field {string} should be {string} in all records")
+    public void fieldShouldBeInAllRecords(String fieldName, String expectedValue) {
+        LOG.info("Asserting field {} = {} in all records", fieldName, expectedValue);
+
+        ValidationContext context = ValidationContext.getCurrent();
+
+        @SuppressWarnings("unchecked")
+        Set<Object> distinctValues = (Set<Object>) context.getVariable("distinct_values");
+
+        if (distinctValues == null) {
+            throw new IllegalStateException("Distinct values not calculated");
+        }
+
+        if (distinctValues.size() != 1 || !distinctValues.contains(expectedValue)) {
+            String message = String.format(
+                    "Field %s validation failed: expected '%s', found values: %s",
+                    fieldName, expectedValue, distinctValues
+            );
+            LOG.error(message);
+            throw new AssertionError(message);
+        }
+
+        LOG.info("Assertion passed: All records have {}={}", fieldName, expectedValue);
+    }
+
+    /**
+     * Assert that one count is a specific multiple of another count
+     * Example: Then "target" count should be 2 times that of "source" count
+     * Example: Then "source" count should be 2 times that of "target" count
+     *
+     * This is useful for validating relationships like:
+     * - Each account should have 2 records in another collection (target = 2x source)
+     * - Each transaction should generate 3 audit entries (target = 3x source)
+     * - Source should have 2x records as target (source = 2x target)
+     *
+     * The first {string} is the subject (what we're checking)
+     * The second {string} is the baseline (what we're comparing against)
+     * subject_count = multiplier × baseline_count
+     *
+     * Expects that count comparison step has been run first.
+     */
+    @Then("{string} count should be {int} times that of {string} count")
+    public void countShouldBeTimesCount(String subjectContext, int multiplier, String baselineContext) {
+        LOG.info("Asserting '{}' count is {} times '{}' count", subjectContext, multiplier, baselineContext);
+
+        ValidationContext context = ValidationContext.getCurrent();
+
+        // Get comparison results from context
+        Integer sourceCount = context.getVariable("count_comparison_source_count", Integer.class);
+        Integer targetCount = context.getVariable("count_comparison_target_count", Integer.class);
+        Double ratio = context.getVariable("count_comparison_ratio", Double.class);
+
+        if (sourceCount == null || targetCount == null) {
+            throw new IllegalStateException("Count comparison results not found. " +
+                    "Make sure to run the comparison step first: " +
+                    "'When I compare \"source\" and \"target\" record counts'");
+        }
+
+        // Determine which count is subject and which is baseline
+        Integer subjectCount;
+        Integer baselineCount;
+
+        if ("target".equalsIgnoreCase(subjectContext) && "source".equalsIgnoreCase(baselineContext)) {
+            // "target" count should be 2 times "source" count
+            subjectCount = targetCount;
+            baselineCount = sourceCount;
+        } else if ("source".equalsIgnoreCase(subjectContext) && "target".equalsIgnoreCase(baselineContext)) {
+            // "source" count should be 2 times "target" count
+            subjectCount = sourceCount;
+            baselineCount = targetCount;
+        } else {
+            throw new IllegalArgumentException(
+                    "Invalid context names. Expected 'source' and 'target' but got: '" +
+                    subjectContext + "' and '" + baselineContext + "'");
+        }
+
+        // Calculate expected subject count
+        int expectedSubjectCount = baselineCount * multiplier;
+
+        LOG.info("Count multiplier check: subject={}({}), baseline={}({}), expected_subject={}, multiplier={}x",
+                subjectContext, subjectCount, baselineContext, baselineCount,
+                expectedSubjectCount, multiplier);
+
+        if (subjectCount != expectedSubjectCount) {
+            String message = String.format(
+                    "Count multiplier validation failed: " +
+                    "Expected '%s' count (%d) to be %dx '%s' count (%d) = %d, but found %d. " +
+                    "Actual ratio: %.2fx",
+                    subjectContext, subjectCount, multiplier, baselineContext, baselineCount,
+                    expectedSubjectCount, subjectCount, ratio
+            );
+            LOG.error(message);
+            throw new AssertionError(message);
+        }
+
+        LOG.info("Assertion passed: '{}' count ({}) = {}x '{}' count ({})",
+                subjectContext, subjectCount, multiplier, baselineContext, baselineCount);
+    }
+
+    @Then("the {string} count should equal the {string} count")
+    public void compareContextCounts(String leftContext, String rightContext) {
+        ValidationContext ctx = ValidationContext.getCurrent();
+
+        Integer left = ctx.getVariable(leftContext + "_count", Integer.class);
+        Integer right = ctx.getVariable(rightContext + "_count", Integer.class);
+
+        if (left == null || right == null) {
+            throw new IllegalStateException(
+                    "Missing count variable: " + leftContext + "_count or " + rightContext + "_count");
+        }
+
+        if (!left.equals(right)) {
+            String message = String.format(
+                    "Expected %s_count (%d) to equal %s_count (%d)",
+                    leftContext, left, rightContext, right
+            );
+            throw new AssertionError(message);
+        }
+    }
+
+    @Then("all validations should pass")
+    public void allValidationsShouldPass() {
+        ValidationContext ctx = ValidationContext.getCurrent();
+        if (ctx == null) {
+            throw new IllegalStateException("ValidationContext is not initialized");
+        }
+
+        Boolean passed = ctx.getVariable("updated_value_check_passed", Boolean.class);
+        if (passed == null) {
+            throw new IllegalStateException("No validation results found in context. " +
+                    "Make sure to execute the validation step before asserting.");
+        }
+
+        if (!passed) {
+            String type = ctx.getVariable("updated_value_check_type", String.class);
+            @SuppressWarnings("unchecked")
+            Map<String, Boolean> fieldResults = (Map<String, Boolean>) ctx.getVariable("updated_value_fieldResults");
+
+            Set<String> failedFields = new HashSet<>();
+            if (fieldResults != null) {
+                for (Map.Entry<String, Boolean> e : fieldResults.entrySet()) {
+                    if (Boolean.FALSE.equals(e.getValue())) {
+                        failedFields.add(e.getKey());
+                    }
+                }
+            }
+
+            String details = fieldResults != null ? fieldResults.toString() : "<no field results>";
+            throw new AssertionError(
+                    "Validation(s) failed" + (type != null ? " for check type: " + type : "") +
+                            ". Failed fields: " + (failedFields.isEmpty() ? "<unknown>" : failedFields) +
+                            ". All field results: " + details);
+        }
+
+        LOG.info("Assertion passed: all validations passed");
+    }
+
+
+    /**
+     * Helper to get first N elements from a collection
+     */
+    private String getFirstN(java.util.Collection<?> collection, int n) {
+        return collection.stream()
+                .limit(n)
+                .map(Object::toString)
+                .reduce((a, b) -> a + ", " + b)
+                .orElse("none");
+    }
+}
