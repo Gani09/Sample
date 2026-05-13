@@ -1,0 +1,96 @@
+package com.fiserv.fef.models;
+
+import java.io.Serializable;
+import java.util.Date;
+import java.util.Map;
+
+/**
+ * Trigger for validation execution from MongoDB pipeline
+ */
+public class ValidationTrigger implements Serializable {
+    
+    private String id;
+    private String processID;
+    private String validationDate;
+    private String status;  // queued, picked, completed, failed
+    private Date createdAt;
+    private Date pickedAt;
+    private Map<String, Object> filters;
+    private String triggerSource;
+    private Date executionStartedAt;
+    private Date completedAt;
+    private Date updatedAt;
+    private String sourceDbName;
+    private String targetDbName;
+
+
+    public ValidationTrigger() {}
+    
+    public ValidationTrigger(String id, String processID, String validationDate) {
+        this.id = id;
+        this.processID = processID;
+        this.validationDate = validationDate;
+        this.status = "queued";
+        this.createdAt = new Date();
+    }
+    
+    // Getters and Setters
+    public String getId() { return id; }
+    public void setId(String id) { this.id = id; }
+    
+    public String getProcessID() { return processID; }
+    public void setProcessID(String processID) { this.processID = processID; }
+
+    public String getValidationDate() { return validationDate; }
+    public void setValidationDate(String validationDate) { this.validationDate = validationDate; }
+    
+    public String getStatus() { return status; }
+    public void setStatus(String status) { this.status = status; }
+    
+    public Date getCreatedAt() { return createdAt; }
+    public void setCreatedAt(Date createdAt) { this.createdAt = createdAt; }
+    
+    public Date getPickedAt() { return pickedAt; }
+    public void setPickedAt(Date pickedAt) { this.pickedAt = pickedAt; }
+
+    public Map<String, Object> getFilters() { return filters; }
+    public void setFilters(Map<String, Object> filters) { this.filters = filters; }
+
+    public String getTriggerSource() { return triggerSource; }
+    public void setTriggerSource(String triggerSource) { this.triggerSource = triggerSource; }
+
+    public Date getExecutionStartedAt() { return executionStartedAt; }
+    public void setExecutionStartedAt(Date executionStartedAt) { this.executionStartedAt = executionStartedAt; }
+
+    public Date getCompletedAt() { return completedAt; }
+    public void setCompletedAt(Date completedAt) { this.completedAt = completedAt; }
+
+    public Date getUpdatedAt() { return updatedAt; }
+    public void setUpdatedAt(Date updatedAt) { this.updatedAt = updatedAt; }
+
+    public String getSourceDbName() { return sourceDbName; }
+    public void setSourceDbName(String sourceDbName) { this.sourceDbName = sourceDbName; }
+
+    public String getTargetDbName() { return targetDbName; }
+    public void setTargetDbName(String targetDbName) { this.targetDbName = targetDbName; }
+
+
+    @Override
+    public String toString() {
+        return "ValidationTrigger{" +
+                "id='" + id + '\'' +
+                ", processID='" + processID + '\'' +
+                ", validationDate='" + validationDate + '\'' +
+                ", status='" + status + '\'' +
+                ", filters=" + filters +
+                ", triggerSource='" + triggerSource + '\'' +
+                ", sourceDbName='" + sourceDbName + '\'' +
+                ", targetDbName='" + targetDbName + '\'' +
+                ", createdAt=" + createdAt +
+                ", pickedAt=" + pickedAt +
+                ", executionStartedAt=" + executionStartedAt +
+                ", completedAt=" + completedAt +
+                ", updatedAt=" + updatedAt +
+                '}';
+    }
+}
