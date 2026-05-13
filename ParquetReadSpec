@@ -1,0 +1,50 @@
+package com.fiserv.fef.parquet.validation;
+
+import java.util.Collections;
+import java.util.List;
+
+public final class ParquetReadSpec {
+    private final String path;
+    private final List<String> selectedFields;
+
+    private ParquetReadSpec(Builder b) {
+        this.path = b.path;
+        this.selectedFields = List.copyOf(b.selectedFields);
+    }
+
+    public String getPath() {
+        return path;
+    }
+
+    public List<String> getSelectedFields() {
+        return Collections.unmodifiableList(selectedFields);
+    }
+
+    public static Builder builder() {
+        return new Builder();
+    }
+
+    public static final class Builder {
+        private String path;
+        private List<String> selectedFields = List.of("*");
+
+        public Builder path(String path) {
+            this.path = path;
+            return this;
+        }
+
+        public Builder selectedFields(List<String> fields) {
+            if (fields != null && !fields.isEmpty()) {
+                this.selectedFields = fields;
+            }
+            return this;
+        }
+
+        public ParquetReadSpec build() {
+            if (path == null || path.isBlank()) {
+                throw new IllegalStateException("Parquet path required");
+            }
+            return new ParquetReadSpec(this);
+        }
+    }
+}
