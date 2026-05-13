@@ -1,0 +1,65 @@
+package com.fiserv.fef.stepdefs;
+
+import com.fiserv.fef.gherkin.annotations.Then;
+import com.fiserv.fef.hadoop.HadoopClientManager;
+import com.fiserv.fef.parquet.util.ParquetRowCountUtil;
+import com.fiserv.fef.parquet.schema.ParquetSchemaAssertions;
+import com.fiserv.fef.utils.PropertiesUtil;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.security.PrivilegedExceptionAction;
+
+/**
+ * Structural validation steps.
+ *
+ * - Schema step delegates to ParquetSchemaAssertions.
+ * - Record-count step runs inside ONE UGI.doAs() and calls ParquetRowCountUtil.countInCurrentUGI
+ *   to avoid nested doAs and auth context drift.
+ */
+public class ParquetSchemaSteps {
+
+    private static final Logger LOG = LoggerFactory.getLogger(ParquetSchemaSteps.class);
+
+    private HadoopClientManager.HadoopClientContext ctx() throws Exception {
+        String fsDefault = PropertiesUtil.getInstance().getProperty("fs.defaultFS", "file:///");
+        return HadoopClientManager.acquire(fsDefault);
+    }
+
+    @Then("parquet schema of file {string} should match schema of file {string}")
+    public void schemaMatch(String srcFile, String tgtFile) throws Exception {
+        try (HadoopClientManager.HadoopClientContext hCtx = ctx()) {
+            int max = Integer.parseInt(PropertiesUtil.getInstance().getProperty("parquet.diff.max.lines", "25"));
+            ParquetSchemaAssertions.assertSchemasMatch(hCtx, srcFile, tgtFile, max);
+            LOG.info("[SchemaValidation][PASS] sourceFile={} targetFile={}", srcFile, tgtFile);
+        }
+    }
+
+    @Then("parquet record count of file {string} should match record count of file {string}")
+    public void recordCountMatch(String srcFile, String tgtFile) throws Exception {
+        try (HadoopClientManager.HadoopClientContext hCtx = ctx()) {
+            hCtx.doAs((PrivilegedExceptionAction<Void>) () -> {
+                ParquetRowCountUtil.Result src = ParquetRowCountUtil.countInCurrentUGI(hCtx, srcFile, ParquetRowCountUtil.Mode.valueOf(
+                        PropertiesUtil.getInstance().getProperty("parquet.row.count.mode", "AUTO").trim().toUpperCase()
+                ));
+                ParquetRowCountUtil.Result tgt = ParquetRowCountUtil.countInCurrentUGI(hCtx, tgtFile, ParquetRowCountUtil.Mode.valueOf(
+                        PropertiesUtil.getInstance().getProperty("parquet.row.count.mode", "AUTO").trim().toUpperCase()
+                ));
+
+                if (src.rowCount != tgt.rowCount) {
+                    throw new AssertionError(
+                            "Parquet record count mismatch:\n" +
+                                    "Source file : " + srcFile + "\n" +
+                                    "Target file : " + tgtFile + "\n" +
+                                    "Source rows : " + src.rowCount + " (" + src.source + ")\n" +
+                                    "Target rows : " + tgt.rowCount + " (" + tgt.source + ")"
+                    );
+                }
+
+                LOG.info("[RecordCountValidation][PASS] sourceFile={} targetFile={} rows={} methodSrc={} methodTgt={}",
+                        srcFile, tgtFile, src.rowCount, src.source, tgt.source);
+                return null;
+            });
+        }
+    }
+}
