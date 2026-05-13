@@ -1,0 +1,39 @@
+package com.fiserv.fef.models;
+
+import java.io.Serializable;
+import java.util.Map;
+
+/**
+ * Configuration for a data source (MongoDB collection, Kafka topic, etc.)
+ */
+public class DataSourceConfig implements Serializable {
+    
+    private String type;        // mongodb, kafka
+    private String collection;  // For MongoDB
+    private String topic;       // For Kafka
+    private Map<String, Object> query;  // Query filter
+    private String profileRole; // sourceProfile, targetProfile, etc.
+
+    public DataSourceConfig() {}
+    
+    public DataSourceConfig(String type, String collection) {
+        this.type = type;
+        this.collection = collection;
+    }
+    
+    // Getters and Setters
+    public String getType() { return type; }
+    public void setType(String type) { this.type = type; }
+    
+    public String getCollection() { return collection; }
+    public void setCollection(String collection) { this.collection = collection; }
+    
+    public String getTopic() { return topic; }
+    public void setTopic(String topic) { this.topic = topic; }
+    
+    public Map<String, Object> getQuery() { return query; }
+    public void setQuery(Map<String, Object> query) { this.query = query; }
+
+    public String getProfileRole() { return profileRole; }
+    public void setProfileRole(String profileRole) { this.profileRole = profileRole; }
+}
