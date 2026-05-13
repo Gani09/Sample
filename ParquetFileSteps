@@ -1,0 +1,200 @@
+package com.fiserv.fef.stepdefs;
+
+import com.fiserv.fef.gherkin.SimpleDataTable;
+import com.fiserv.fef.gherkin.annotations.Given;
+import com.fiserv.fef.gherkin.annotations.When;
+import com.fiserv.fef.parquet.filter.FilterCondition;
+import com.fiserv.fef.parquet.filter.Operator;
+import com.fiserv.fef.parquet.service.ParquetService;
+import com.fiserv.fef.parquet.validation.ParquetReadSpec;
+import com.fiserv.fef.parquet.validation.ScenarioContextHolder;
+import com.fiserv.fef.parquet.validation.ValidationContext;
+
+import java.util.*;
+
+/**
+ * Parquet file step definitions.
+ *
+ * NOTE: Scenario lifecycle is handled by your existing Hook class.
+ */
+public class ParquetFileSteps {
+
+    @Given("I read {string} from {string} parquet file as {string}")
+    public void readParquet(String fieldsCsv, String path, String side) {
+        ValidationContext ctx = ScenarioContextHolder.getOrInit();
+        ParquetReadSpec spec = ParquetReadSpec.builder()
+                .path(path)
+                .selectedFields(parseFields(fieldsCsv))
+                .build();
+        setSideSpec(ctx, side, spec);
+    }
+
+    @Given("I read {string} from {string} parquet file as {string} data filtered by:")
+    public void readParquetFiltered(String fieldsCsv, String path, String side, SimpleDataTable filtersTable) {
+        ValidationContext ctx = ScenarioContextHolder.getOrInit();
+
+        ParquetReadSpec spec = ParquetReadSpec.builder()
+                .path(path)
+                .selectedFields(parseFields(fieldsCsv))
+                .build();
+        setSideSpec(ctx, side, spec);
+
+        List<FilterCondition> parsed = parseFilters(filtersTable);
+
+        // Empty/blank filter keys => behave like unfiltered read
+        if (parsed.isEmpty()) {
+            ctx.setFilters(List.of());
+            return;
+        }
+
+        // Ensure both steps use the same filters (UpdatedValue compare requires same filter set)
+        List<FilterCondition> existing = ctx.getFilters();
+        if (existing != null && !existing.isEmpty() && !existing.equals(parsed)) {
+            throw new IllegalStateException(
+                    "Filter mismatch across steps. UpdatedValue requires same filter set for source and target. " +
+                            "existing=" + existing + " new=" + parsed);
+        }
+        ctx.setFilters(parsed);
+    }
+
+    @When("I perform {string} check on source and target columnar data for below fields:")
+    public void performCheckColumnar(String checkType, SimpleDataTable fieldsTable) {
+        performCheckInternal(checkType, fieldsTable);
+    }
+
+    // Backward-compatible wording
+    @When("I perform {string} check on source and target data for below fields:")
+    public void performCheckLegacy(String checkType, SimpleDataTable fieldsTable) {
+        performCheckInternal(checkType, fieldsTable);
+    }
+
+    private void performCheckInternal(String checkType, SimpleDataTable fieldsTable) {
+        if (checkType == null || !"updatedvalue".equalsIgnoreCase(checkType.trim())) {
+            throw new UnsupportedOperationException("Only UpdatedValue check is supported. got=" + checkType);
+        }
+
+        ValidationContext ctx = ScenarioContextHolder.getOrInit();
+        if (ctx.getSource() == null || ctx.getTarget() == null) {
+            throw new IllegalStateException("Source/Target parquet specs are not initialized. Ensure Given steps ran.");
+        }
+
+        Map<String, Boolean> expected = parseExpectedUpdates(fieldsTable);
+
+        try (ParquetService svc = new ParquetService()) {
+            svc.validateUpdatedValues(ctx.getSource(), ctx.getTarget(), ctx.getFilters(), expected);
+        }
+    }
+
+    private static void setSideSpec(ValidationContext ctx, String side, ParquetReadSpec spec) {
+        String s = (side == null) ? "" : side.trim().toLowerCase();
+        if ("source".equals(s)) {
+            ctx.setSource(spec);
+        } else if ("target".equals(s)) {
+            ctx.setTarget(spec);
+        } else {
+            throw new IllegalArgumentException("Unknown side alias: " + side + " (expected 'source' or 'target')");
+        }
+    }
+
+    private static List<String> parseFields(String csv) {
+        if (csv == null) return List.of("*");
+        String v = csv.trim();
+        if (v.isEmpty() || "*".equals(v)) return List.of("*");
+        String[] parts = v.split(",");
+        List<String> out = new ArrayList<>();
+        for (String p : parts) {
+            if (p == null) continue;
+            String f = p.trim();
+            if (!f.isEmpty()) out.add(f);
+        }
+        return out.isEmpty() ? List.of("*") : out;
+    }
+
+    private static List<FilterCondition> parseFilters(SimpleDataTable table) {
+        if (table == null) return List.of();
+        List<Map<String, String>> rows = table.asMaps(String.class, String.class);
+        if (rows == null || rows.isEmpty()) return List.of();
+
+        List<FilterCondition> out = new ArrayList<>();
+        for (Map<String, String> r : rows) {
+            if (r == null) continue;
+
+            // IMPORTANT: tolerate header spacing like "filter_key      "
+            String key = safeTrim(getCell(r, "filter_key"));
+            if (key.isEmpty()) continue;
+
+            String cond = safeTrim(getCell(r, "condition"));
+            Operator op = parseOperator(cond);
+
+            String val = safeTrim(getCell(r, "filter_value"));
+            if (val.isEmpty()) {
+                out.add(FilterCondition.joinKeyOnly(key));
+            } else {
+                if (op != Operator.EQ) {
+                    throw new UnsupportedOperationException("Only eq supported for parquet filter_value. key=" + key + " op=" + op);
+                }
+                out.add(FilterCondition.of(key, op, val));
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Fetch a cell by header name while tolerating whitespace/case differences.
+     */
+    private static String getCell(Map<String, String> row, String header) {
+        if (row == null || header == null) return null;
+        // exact first
+        if (row.containsKey(header)) return row.get(header);
+
+        String target = norm(header);
+        for (Map.Entry<String, String> e : row.entrySet()) {
+            if (e.getKey() == null) continue;
+            if (norm(e.getKey()).equals(target)) {
+                return e.getValue();
+            }
+        }
+        return null;
+    }
+
+    private static String norm(String s) {
+        return (s == null) ? "" : s.trim().toLowerCase().replace(" ", "");
+    }
+
+    private static Operator parseOperator(String s) {
+        if (s == null || s.isBlank()) return Operator.EQ;
+        String v = s.trim().toUpperCase();
+        return switch (v) {
+            case "EQ" -> Operator.EQ;
+            case "NE" -> Operator.NE;
+            case "GT" -> Operator.GT;
+            case "GTE" -> Operator.GTE;
+            case "LT" -> Operator.LT;
+            case "LTE" -> Operator.LTE;
+            case "IN" -> Operator.IN;
+            case "NONE" -> Operator.NONE;
+            default -> throw new IllegalArgumentException("Unsupported operator: " + s);
+        };
+    }
+
+    private static String safeTrim(String s) {
+        return (s == null) ? "" : s.trim();
+    }
+
+    private static Map<String, Boolean> parseExpectedUpdates(SimpleDataTable table) {
+        if (table == null) return Map.of();
+        List<Map<String, String>> rows = table.asMaps(String.class, String.class);
+        if (rows == null || rows.isEmpty()) return Map.of();
+
+        Map<String, Boolean> out = new LinkedHashMap<>();
+        for (Map<String, String> r : rows) {
+            if (r == null) continue;
+            String field = safeTrim(getCell(r, "fieldName"));
+            if (field.isEmpty()) continue;
+            String upd = safeTrim(getCell(r, "Updated"));
+            boolean b = "true".equalsIgnoreCase(upd) || "yes".equalsIgnoreCase(upd) || "y".equalsIgnoreCase(upd);
+            out.put(field, b);
+        }
+        return out;
+    }
+}
