@@ -1,0 +1,153 @@
+package com.fiserv.fef.parquet.schema;
+
+import com.fiserv.fef.hadoop.HadoopClientManager;
+import com.fiserv.fef.parquet.filter.ParquetFooterCache;
+import com.fiserv.fef.parquet.util.ParquetReaderUtil;
+import com.fiserv.fef.parquet.util.ParquetSchemaDiffUtil;
+import com.fiserv.fef.utils.PropertiesUtil;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
+import org.apache.parquet.hadoop.metadata.ParquetMetadata;
+import org.apache.parquet.schema.MessageType;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.net.URI;
+import java.security.PrivilegedExceptionAction;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Objects;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+/**
+ * File-based Parquet schema assertions.
+ * Goal: run schema read + diff inside ONE UGI.doAs() boundary to avoid auth context drift.
+ */
+public final class ParquetSchemaAssertions {
+
+    private static final Logger LOG = LoggerFactory.getLogger(ParquetSchemaAssertions.class);
+
+    private ParquetSchemaAssertions() {
+    }
+
+    public static void assertSchemasMatch(HadoopClientManager.HadoopClientContext hCtx,
+                                          String srcFile,
+                                          String tgtFile,
+                                          int maxDiffLines) throws Exception {
+
+        Objects.requireNonNull(hCtx, "hCtx");
+        Objects.requireNonNull(srcFile, "srcFile");
+        Objects.requireNonNull(tgtFile, "tgtFile");
+
+        Set<String> ignoreFields = loadIgnoreFields();
+        boolean ignoreLeavesOnly = loadIgnoreLeavesOnly();
+
+        hCtx.doAs((PrivilegedExceptionAction<Void>) () -> {
+
+            MessageType src = readSchemaInCurrentUGI(hCtx, srcFile);
+            MessageType tgt = readSchemaInCurrentUGI(hCtx, tgtFile);
+
+            String diff = ParquetSchemaDiffUtil.diff(
+                    src,
+                    tgt,
+                    maxDiffLines,
+                    ignoreFields,
+                    ignoreLeavesOnly
+            );
+
+            if (diff != null && !diff.isBlank()) {
+                String msg = "Parquet schema mismatch\n" +
+                        "ignoreFields=" + ignoreFields + "\n" +
+                        "ignoreLeavesOnly=" + ignoreLeavesOnly + "\n" +
+                        "srcFingerprint=" + ParquetFooterCache.schemaFingerprint(src) + "\n" +
+                        "tgtFingerprint=" + ParquetFooterCache.schemaFingerprint(tgt) + "\n\n" +
+                        diff;
+                throw new AssertionError(msg);
+            }
+
+            LOG.info(
+                    "[SchemaMatch] OK srcFingerprint={} tgtFingerprint={}",
+                    ParquetFooterCache.schemaFingerprint(src),
+                    ParquetFooterCache.schemaFingerprint(tgt)
+            );
+            return null;
+        });
+    }
+
+    /**
+     * Reads schema under the CURRENT UGI context.
+     * IMPORTANT: must be called from within hCtx.doAs(...)
+     */
+    static MessageType readSchemaInCurrentUGI(HadoopClientManager.HadoopClientContext hCtx,
+                                              String parquetFile) throws Exception {
+
+        Configuration conf = hCtx.conf();
+        String fsDefault = conf.get("fs.defaultFS", "file:///");
+        String normalized = ParquetReaderUtil.resolveParquetFilePath(parquetFile, fsDefault);
+
+        Path path = new Path(normalized);
+        FileSystem fs = newFileSystemInCurrentUGI(conf, path);
+        try {
+            ParquetMetadata footer =
+                    ParquetFooterCache.readFooterCached(conf, fs, path);
+            return footer.getFileMetaData().getSchema();
+        } finally {
+            try {
+                fs.close();
+            } catch (Exception ignore) {
+                // no-op
+            }
+        }
+    }
+
+    /**
+     * Create a FileSystem instance under CURRENT UGI.
+     * <p>
+     * IMPORTANT:
+     * - Do NOT construct scheme-only URIs like "file:"
+     * - Let Hadoop resolve FS from fs.defaultFS
+     * - Use newInstance() so the caller can safely close it
+     */
+    public static FileSystem newFileSystemInCurrentUGI(Configuration conf, Path path)
+            throws Exception {
+
+        FileSystem fs = FileSystem.newInstance(conf);
+
+        URI resolved = fs.getUri();
+        LOG.info(
+                "Resolved Hadoop FileSystem: uri={}, scheme={}, authority={}, fs.defaultFS={}, path={}",
+                resolved,
+                resolved.getScheme(),
+                resolved.getAuthority(),
+                conf.get("fs.defaultFS"),
+                path
+        );
+
+        return fs;
+    }
+
+    private static Set<String> loadIgnoreFields() {
+        String csv = PropertiesUtil.getInstance()
+                .getProperty("parquet.schema.diff.ignore.fields", "")
+                .trim();
+        if (csv.isEmpty()) {
+            return Collections.emptySet();
+        }
+        return Arrays.stream(csv.split(","))
+                .map(String::trim)
+                .filter(s -> !s.isEmpty())
+                .collect(Collectors.toSet());
+    }
+
+    private static boolean loadIgnoreLeavesOnly() {
+        return Boolean.parseBoolean(
+                PropertiesUtil.getInstance()
+                        .getProperty(
+                                "parquet.schema.diff.ignore.leaves.only",
+                                "false"
+                        )
+        );
+    }
+}
