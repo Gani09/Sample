@@ -1,0 +1,19 @@
+package com.fiserv.fef.exceptions;
+
+/**
+ * Base exception for FEF validation engine
+ */
+public class FEFValidationException extends RuntimeException {
+    
+    public FEFValidationException(String message) {
+        super(message);
+    }
+    
+    public FEFValidationException(String message, Throwable cause) {
+        super(message, cause);
+    }
+    
+    public FEFValidationException(Throwable cause) {
+        super(cause);
+    }
+}
