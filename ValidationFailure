@@ -1,0 +1,182 @@
+package com.fiserv.fef.parquet.validation;
+
+import java.time.OffsetDateTime;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Canonical failure model used by both text and JSON output.
+ * <p>
+ * Backward compatibility:
+ * - Preserves factory methods used by UpdatedValueComparator:
+ * valueMismatch(), updatedExpectedButUnchanged(), notExpectedButChanged().
+ */
+public class ValidationFailure {
+
+    // Record-level metadata (optional, can be filled by caller)
+    private String validationType;
+    private String status;
+    private OffsetDateTime timestamp;
+    private String sourceFile;
+    private String targetFile;
+    private Map<String, String> joinKeys;
+
+    // Field-level details
+    private List<FieldFailure> fieldFailures;
+
+    // Add missing fields for passed/failed counts
+    private int passedCount;
+    private int failedCount;
+
+    // For Jackson / frameworks
+    public ValidationFailure() {
+    }
+
+    private ValidationFailure(List<FieldFailure> fieldFailures) {
+        this.fieldFailures = fieldFailures;
+    }
+
+    // -------------------- Factory methods (existing call sites) --------------------
+
+    public static ValidationFailure updatedExpectedButUnchanged(String key, String field, Object src, Object tgt) {
+        return single(new FieldFailure(key, field, "UPDATED", "UNCHANGED", src, tgt));
+    }
+
+    public static ValidationFailure notExpectedButChanged(String key, String field, Object src, Object tgt) {
+        return single(new FieldFailure(key, field, "UNCHANGED", "UPDATED", src, tgt));
+    }
+
+    public static ValidationFailure valueMismatch(String key, String field, Object src, Object tgt) {
+        return single(new FieldFailure(key, field, "EQUAL", "DIFFERENT", src, tgt));
+    }
+
+    public static ValidationFailure of(List<FieldFailure> failures) {
+        return new ValidationFailure(failures);
+    }
+
+    private static ValidationFailure single(FieldFailure ff) {
+        return new ValidationFailure(Collections.singletonList(ff));
+    }
+
+    // -------------------- Getters --------------------
+
+    public String getValidationType() {
+        return validationType;
+    }
+
+    public String getStatus() {
+        return status;
+    }
+
+    public OffsetDateTime getTimestamp() {
+        return timestamp;
+    }
+
+    public String getSourceFile() {
+        return sourceFile;
+    }
+
+    public String getTargetFile() {
+        return targetFile;
+    }
+
+    public Map<String, String> getJoinKeys() {
+        return joinKeys;
+    }
+
+    public List<FieldFailure> getFieldFailures() {
+        return fieldFailures;
+    }
+
+    // Add getters and setters for passed/failed counts
+    public int getPassedCount() {
+        return passedCount;
+    }
+
+    public void setPassedCount(int passedCount) {
+        this.passedCount = passedCount;
+    }
+
+    public int getFailedCount() {
+        return failedCount;
+    }
+
+    public void setFailedCount(int failedCount) {
+        this.failedCount = failedCount;
+    }
+
+    // -------------------- Setters (optional enrichment) --------------------
+
+    public void setValidationType(String validationType) {
+        this.validationType = validationType;
+    }
+
+    public void setStatus(String status) {
+        this.status = status;
+    }
+
+    public void setTimestamp(OffsetDateTime timestamp) {
+        this.timestamp = timestamp;
+    }
+
+    public void setSourceFile(String sourceFile) {
+        this.sourceFile = sourceFile;
+    }
+
+    public void setTargetFile(String targetFile) {
+        this.targetFile = targetFile;
+    }
+
+    public void setJoinKeys(Map<String, String> joinKeys) {
+        this.joinKeys = joinKeys;
+    }
+
+    public void setFieldFailures(List<FieldFailure> fieldFailures) {
+        this.fieldFailures = fieldFailures;
+    }
+
+    // -------------------- FieldFailure --------------------
+
+    public static class FieldFailure {
+        private final String key;
+        private final String field;
+        private final String expected;
+        private final String actual;
+        private final Object src;
+        private final Object tgt;
+
+        public FieldFailure(String key, String field, String expected, String actual, Object src, Object tgt) {
+            this.key = key;
+            this.field = field;
+            this.expected = expected;
+            this.actual = actual;
+            this.src = src;
+            this.tgt = tgt;
+        }
+
+        public String getKey() {
+            return key;
+        }
+
+        public String getField() {
+            return field;
+        }
+
+        public String getExpected() {
+            return expected;
+        }
+
+        public String getActual() {
+            return actual;
+        }
+
+        public Object getSrc() {
+            return src;
+        }
+
+        public Object getTgt() {
+            return tgt;
+        }
+    }
+}
