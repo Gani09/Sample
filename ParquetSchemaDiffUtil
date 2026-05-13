@@ -1,0 +1,97 @@
+package com.fiserv.fef.parquet.util;
+
+import org.apache.parquet.schema.MessageType;
+import org.apache.parquet.schema.PrimitiveType;
+import org.apache.parquet.schema.Type;
+
+import java.util.*;
+
+/** Schema diff helper (supports ignore-fields and ignore-leaves-only). */
+public final class ParquetSchemaDiffUtil {
+    private ParquetSchemaDiffUtil() {}
+
+    // Backward-compatible overload
+    public static String diff(MessageType src, MessageType tgt, int maxLines) {
+        return diff(src, tgt, maxLines, Collections.emptySet(), false);
+    }
+
+    public static String diff(MessageType src,
+                              MessageType tgt,
+                              int maxLines,
+                              Set<String> ignoreFields,
+                              boolean ignoreLeavesOnly) {
+        if (src == null || tgt == null) {
+            return "";
+        }
+        Map<String, String> srcMap = flatten(src, ignoreFields, ignoreLeavesOnly);
+        Map<String, String> tgtMap = flatten(tgt, ignoreFields, ignoreLeavesOnly);
+
+        StringBuilder sb = new StringBuilder();
+        int lines = 0;
+
+        for (String p : srcMap.keySet()) {
+            if (!tgtMap.containsKey(p)) {
+                sb.append("Schema missing in target: ").append(p).append('\n');
+                if (++lines >= maxLines) return sb.toString();
+            }
+        }
+        for (String p : tgtMap.keySet()) {
+            if (!srcMap.containsKey(p)) {
+                sb.append("Schema extra in target: ").append(p).append('\n');
+                if (++lines >= maxLines) return sb.toString();
+            }
+        }
+        for (String p : srcMap.keySet()) {
+            if (!tgtMap.containsKey(p)) continue;
+            if (!Objects.equals(srcMap.get(p), tgtMap.get(p))) {
+                sb.append("Schema type mismatch: ").append(p)
+                        .append(" src=[").append(srcMap.get(p))
+                        .append("] tgt=[").append(tgtMap.get(p)).append("]\n");
+                if (++lines >= maxLines) return sb.toString();
+            }
+        }
+        return sb.toString();
+    }
+
+    private static Map<String, String> flatten(MessageType schema,
+                                               Set<String> ignoreFields,
+                                               boolean ignoreLeavesOnly) {
+        Map<String, String> out = new LinkedHashMap<>();
+        for (Type t : schema.getFields()) {
+            walk("", t, out, ignoreFields, ignoreLeavesOnly);
+        }
+        return out;
+    }
+
+    private static void walk(String prefix,
+                             Type t,
+                             Map<String, String> out,
+                             Set<String> ignoreFields,
+                             boolean ignoreLeavesOnly) {
+        String path = prefix.isEmpty() ? t.getName() : prefix + "." + t.getName();
+        boolean ignored = isIgnored(path, ignoreFields);
+        if (ignored && (!ignoreLeavesOnly || t.isPrimitive())) {
+            return;
+        }
+        out.put(path, signature(t));
+        if (!t.isPrimitive()) {
+            for (Type c : t.asGroupType().getFields()) {
+                walk(path, c, out, ignoreFields, ignoreLeavesOnly);
+            }
+        }
+    }
+
+    private static boolean isIgnored(String path, Set<String> ignore) {
+        if (ignore == null || ignore.isEmpty()) return false;
+        String leaf = path.contains(".") ? path.substring(path.lastIndexOf('.') + 1) : path;
+        return ignore.contains(path) || ignore.contains(leaf);
+    }
+
+    private static String signature(Type t) {
+        if (t.isPrimitive()) {
+            PrimitiveType p = t.asPrimitiveType();
+            return p.getRepetition() + " " + p.getPrimitiveTypeName();
+        }
+        return t.getRepetition() + " GROUP";
+    }
+}
