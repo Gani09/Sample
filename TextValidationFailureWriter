@@ -1,0 +1,14 @@
+package com.fiserv.fef.parquet.validation;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public class TextValidationFailureWriter implements ValidationFailureWriter {
+
+    private static final Logger LOG = LoggerFactory.getLogger(TextValidationFailureWriter.class);
+
+    @Override
+    public void write(ValidationFailure failure) {
+        LOG.error(ValidationFailureTextFormatter.format(failure));
+    }
+}
