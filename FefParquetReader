@@ -1,0 +1,346 @@
+package com.fiserv.fef.parquet;
+
+import com.fiserv.fef.hadoop.HadoopClientManager;
+import com.fiserv.fef.parquet.filter.CompiledParquetFilterMatcher;
+import com.fiserv.fef.parquet.filter.FilterSpec;
+import com.fiserv.fef.parquet.filter.ParquetFooterCache;
+import com.fiserv.fef.parquet.schema.ParquetSchemaFieldResolver;
+import com.fiserv.fef.parquet.schema.SchemaDrivenFilterValidator;
+import com.fiserv.fef.parquet.util.AdaptiveParquetRowCount;
+import com.fiserv.fef.parquet.validation.ParquetGroupValueExtractor;
+import com.fiserv.fef.parquet.util.ParquetReaderUtil;
+import com.fiserv.fef.parquet.util.StopScanException;
+import com.fiserv.fef.utils.PropertiesUtil;
+import com.fiserv.fef.utils.Timing;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
+import org.apache.parquet.example.data.Group;
+import org.apache.parquet.filter2.compat.FilterCompat;
+import org.apache.parquet.filter2.predicate.FilterApi;
+import org.apache.parquet.filter2.predicate.FilterPredicate;
+import org.apache.parquet.hadoop.ParquetReader;
+import org.apache.parquet.hadoop.example.GroupReadSupport;
+import org.apache.parquet.hadoop.metadata.ParquetMetadata;
+import org.apache.parquet.io.api.Binary;
+import org.apache.parquet.schema.MessageType;
+import org.apache.parquet.schema.Type;
+import org.apache.parquet.schema.PrimitiveType;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.security.PrivilegedExceptionAction;
+import java.util.*;
+import java.util.function.Consumer;
+
+/**
+ * Core reader used by:
+ *  - ParquetTestRunnerMain (direct)
+ *  - FlinkSafeParquetReader (wrapper)
+ *
+ * Behavior:
+ *  - Reads footer (schema) via ParquetFooterCache (cached)
+ *  - Builds schema-driven FilterSpec list using SchemaDrivenFilterValidator.validate(...)
+ *  - Streams rows; for matches, decodes selected output fields into Map<String,Object>
+ *  - Supports early termination via StopScanException (caught and treated as normal stop)
+ */
+public class FefParquetReader {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger(FefParquetReader.class);
+
+    private final HadoopClientManager.HadoopClientContext hadoopCtx;
+
+    /** Emits schema so wrapper/main can access schema after first read. */
+    private final Consumer<MessageType> schemaListener;
+
+    /** Emits row count info (METADATA or SCAN) for observability. */
+    public static final class RowCountInfo {
+        public final long rowCount;
+        public final String source; // "METADATA" or "SCAN"
+        public RowCountInfo(long rowCount, String source) {
+            this.rowCount = rowCount;
+            this.source = source;
+        }
+    }
+
+    private final Consumer<RowCountInfo> rowCountListener;
+
+    /** Captured schema for main usage (getLastReadSchema). */
+    private volatile MessageType lastReadSchema;
+
+    public FefParquetReader(HadoopClientManager.HadoopClientContext hadoopCtx) {
+        this(hadoopCtx, null, null);
+    }
+
+    public FefParquetReader(HadoopClientManager.HadoopClientContext hadoopCtx,
+                            Consumer<MessageType> schemaListener) {
+        this(hadoopCtx, schemaListener, null);
+    }
+
+    public FefParquetReader(HadoopClientManager.HadoopClientContext hadoopCtx,
+                            Consumer<MessageType> schemaListener,
+                            Consumer<RowCountInfo> rowCountListener) {
+        this.hadoopCtx = Objects.requireNonNull(hadoopCtx, "hadoopCtx");
+        this.schemaListener = schemaListener;
+        this.rowCountListener = rowCountListener;
+    }
+
+    public MessageType getLastReadSchema() {
+        return lastReadSchema;
+    }
+
+    /**
+     * Read and decode filtered records.
+     *
+     * @param inputFilters raw filter string (e.g. "a=1,b=2"); may be blank
+     * @param fieldNames output fields string; may be blank (=> schema resolver returns all leaf fields)
+     * @param fullFileName parquet path or URI
+     * @param onRow consumer of decoded row maps
+     */
+    public void processFilteredRecords(String inputFilters,
+                                       String fieldNames,
+                                       String fullFileName,
+                                       Consumer<Map<String, Object>> onRow) throws Exception {
+
+        final long tTotal = Timing.start();
+
+        try {
+            hadoopCtx.doAs((PrivilegedExceptionAction<Void>) () -> {
+
+                final Configuration conf = hadoopCtx.conf();
+                final String fsDefault = conf.get("fs.defaultFS", "file:///");
+                final String normalized = ParquetReaderUtil.resolveParquetFilePath(fullFileName, fsDefault);
+
+                final Path path = new Path(normalized);
+                final FileSystem fs = hadoopCtx.fsFor(path);
+
+                // ---- Footer/schema (cached) ----
+                final ParquetMetadata md = ParquetFooterCache.readFooterCached(conf, fs, path);
+                final MessageType schema = md.getFileMetaData().getSchema();
+                this.lastReadSchema = schema;
+
+                if (schemaListener != null) {
+                    schemaListener.accept(schema);
+                }
+
+                // ---- Row count (existing AdaptiveParquetRowCount behavior) ----
+                if (rowCountListener != null) {
+                    AdaptiveParquetRowCount.Result rc = AdaptiveParquetRowCount.count(hadoopCtx, normalized);
+                    rowCountListener.accept(new RowCountInfo(rc.rowCount, rc.source));
+                }
+
+                // ---- Output fields plan ----
+                final boolean matchAnywhere = Boolean.parseBoolean(
+                        PropertiesUtil.getInstance().getProperty("record.match.anywhere", "false")
+                );
+                final boolean allowAmbiguousShortNames = matchAnywhere; // recommended linkage
+                final ParquetSchemaFieldResolver.OutputFieldPlan plan =
+                        ParquetSchemaFieldResolver.buildOutputPlan(fieldNames, schema, allowAmbiguousShortNames);
+
+                // ---- Filters ----
+                final Map<String, String> rawFilters = parseFilters(inputFilters);
+                final String flatDelimiter = PropertiesUtil.getInstance()
+                        .getProperty("parquet.flat.delimiter", "").trim();
+
+                final List<FilterSpec> specs =
+                        SchemaDrivenFilterValidator.validate(schema, rawFilters, matchAnywhere, flatDelimiter);
+
+                // ---- Stream rows ----
+                final GroupReadSupport readSupport = new GroupReadSupport();
+
+                // Build Parquet predicate pushdown filter for top-level primitive columns
+                FilterCompat.Filter pushdownFilter = buildPushdownFilter(rawFilters, schema);
+
+                try (ParquetReader<Group> reader =
+                             ParquetReader.builder(readSupport, path)
+                                     .withConf(conf)
+                                     .withFilter(pushdownFilter)
+                                     .build()) {
+
+                    Group g;
+                    while ((g = reader.read()) != null) {
+
+                        // Apply all specs; if no specs => accept
+                        boolean ok = true;
+                        for (FilterSpec spec : specs) {
+                            if (!CompiledParquetFilterMatcher.matches(g, spec)) {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        if (!ok) continue;
+
+                        Map<String, Object> decoded = decodeGroup(g, plan);
+                        onRow.accept(decoded);
+                    }
+                } catch (StopScanException stop) {
+                    // normal early stop
+                }
+
+                return null;
+            });
+        } finally {
+            Timing.log(LOGGER, "FefParquetReader.processFilteredRecords(total)", tTotal);
+        }
+    }
+
+    /**
+     * Parse filters like: "a=1,b=2" into a map.
+     * Empty/blank => empty map.
+     */
+    private static Map<String, String> parseFilters(String inputFilters) {
+        Map<String, String> out = new LinkedHashMap<>();
+        if (inputFilters == null) return out;
+
+        String s = inputFilters.trim();
+        if (s.isEmpty()) return out;
+
+        // allow separators: ',' or ';'
+        String[] parts = s.split("[,;]");
+        for (String p : parts) {
+            if (p == null) continue;
+            String token = p.trim();
+            if (token.isEmpty()) continue;
+
+            int eq = token.indexOf('=');
+            if (eq < 0) {
+                // tolerate "key:value"
+                eq = token.indexOf(':');
+            }
+            if (eq < 0) {
+                // ignore malformed token
+                continue;
+            }
+
+            String k = token.substring(0, eq).trim();
+            String v = token.substring(eq + 1).trim();
+            if (!k.isEmpty()) {
+                out.put(k, v);
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Decode a Group according to OutputFieldPlan:
+     * - If alias has one candidate path => extract that
+     * - If alias has multiple candidate paths => choose the ONLY non-null value (else ambiguous)
+     */
+    private static Map<String, Object> decodeGroup(Group g, ParquetSchemaFieldResolver.OutputFieldPlan plan) {
+        Map<String, Object> row = new LinkedHashMap<>();
+
+        List<String> aliases = plan.aliases;
+        List<List<String>> candidates = plan.candidatePaths;
+
+        for (int i = 0; i < aliases.size(); i++) {
+            String alias = aliases.get(i);
+            List<String> paths = candidates.get(i);
+
+            Object value = null;
+
+            if (paths == null || paths.isEmpty()) {
+                value = null;
+            } else if (paths.size() == 1) {
+                value = ParquetGroupValueExtractor.getValue(g, paths.get(0));
+            } else {
+                Object found = null;
+                String foundPath = null;
+                for (String p : paths) {
+                    Object v = ParquetGroupValueExtractor.getValue(g, p);
+                    if (v != null) {
+                        if (found != null) {
+                            throw new IllegalStateException(
+                                    "Ambiguous output field '" + alias + "': multiple non-null paths: "
+                                            + foundPath + " and " + p
+                            );
+                        }
+                        found = v;
+                        foundPath = p;
+                    }
+                }
+                value = found;
+            }
+
+            row.put(alias, value);
+        }
+        return row;
+    }
+
+    /**
+     * Build a Parquet predicate pushdown filter from raw filters.
+     * Only applies to top-level primitive (non-nested) columns for row group skipping.
+     * Falls back to FilterCompat.NOOP if no pushdown is possible.
+     */
+    private static FilterCompat.Filter buildPushdownFilter(Map<String, String> rawFilters, MessageType schema) {
+        if (rawFilters == null || rawFilters.isEmpty()) {
+            return FilterCompat.NOOP;
+        }
+
+        FilterPredicate combined = null;
+
+        for (Map.Entry<String, String> entry : rawFilters.entrySet()) {
+            String key = entry.getKey();
+            String value = entry.getValue();
+
+            // Only pushdown for top-level primitive fields
+            if (!schema.containsField(key)) continue;
+            Type fieldType = schema.getType(key);
+            if (!fieldType.isPrimitive()) continue;
+
+            PrimitiveType primitiveType = fieldType.asPrimitiveType();
+            FilterPredicate predicate = null;
+
+            try {
+                switch (primitiveType.getPrimitiveTypeName()) {
+                    case BINARY:
+                    case FIXED_LEN_BYTE_ARRAY:
+                        predicate = FilterApi.eq(
+                                FilterApi.binaryColumn(key),
+                                Binary.fromString(value));
+                        break;
+                    case INT32:
+                        predicate = FilterApi.eq(
+                                FilterApi.intColumn(key),
+                                Integer.parseInt(value));
+                        break;
+                    case INT64:
+                        predicate = FilterApi.eq(
+                                FilterApi.longColumn(key),
+                                Long.parseLong(value));
+                        break;
+                    case FLOAT:
+                        predicate = FilterApi.eq(
+                                FilterApi.floatColumn(key),
+                                Float.parseFloat(value));
+                        break;
+                    case DOUBLE:
+                        predicate = FilterApi.eq(
+                                FilterApi.doubleColumn(key),
+                                Double.parseDouble(value));
+                        break;
+                    case BOOLEAN:
+                        predicate = FilterApi.eq(
+                                FilterApi.booleanColumn(key),
+                                Boolean.parseBoolean(value));
+                        break;
+                    default:
+                        // Unsupported type for pushdown
+                        break;
+                }
+            } catch (NumberFormatException e) {
+                LOGGER.debug("Cannot pushdown filter for key={}, value={}: {}", key, value, e.getMessage());
+            }
+
+            if (predicate != null) {
+                combined = (combined == null) ? predicate : FilterApi.and(combined, predicate);
+            }
+        }
+
+        if (combined != null) {
+            LOGGER.info("Parquet predicate pushdown enabled for {} filter(s)", rawFilters.size());
+            return FilterCompat.get(combined);
+        }
+
+        return FilterCompat.NOOP;
+    }
+}
