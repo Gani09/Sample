@@ -1,0 +1,214 @@
+package com.fiserv.fef.parquet.util;
+
+import com.fiserv.fef.hadoop.HadoopClientManager;
+import com.fiserv.fef.parquet.filter.FilterCondition;
+import com.fiserv.fef.parquet.filter.ParquetFooterCache;
+import com.fiserv.fef.utils.PropertiesUtil;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
+import org.apache.parquet.example.data.Group;
+import org.apache.parquet.hadoop.ParquetReader;
+import org.apache.parquet.hadoop.example.GroupReadSupport;
+import org.apache.parquet.hadoop.metadata.BlockMetaData;
+import org.apache.parquet.hadoop.metadata.ParquetMetadata;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.net.URI;
+import java.security.PrivilegedExceptionAction;
+import java.util.List;
+import java.util.Objects;
+
+/**
+ * Generic Parquet row-count utility.
+ *
+ * Design goals:
+ *  - Provide ONE place to implement row-count (AUTO / METADATA / SCAN)
+ *  - Avoid nested or fragmented UGI contexts
+ *  - Be safe for local FS, HDFS, Kerberos environments
+ */
+public final class ParquetRowCountUtil {
+
+    private static final Logger LOG =
+            LoggerFactory.getLogger(ParquetRowCountUtil.class);
+
+    public enum Mode { AUTO, METADATA, SCAN }
+
+    public static final class Result {
+        public final long rowCount;
+        public final String source;  // "METADATA" or "SCAN"
+        public final String normalizedPath;
+
+        public Result(long rowCount, String source, String normalizedPath) {
+            this.rowCount = rowCount;
+            this.source = source;
+            this.normalizedPath = normalizedPath;
+        }
+    }
+
+    private ParquetRowCountUtil() {}
+
+    /** Count rows. Manages UGI.doAs() internally. */
+    public static Result count(HadoopClientManager.HadoopClientContext hCtx,
+                               String parquetFile) {
+
+        String m = PropertiesUtil.getInstance()
+                .getProperty("parquet.row.count.mode", "AUTO")
+                .trim()
+                .toUpperCase();
+
+        Mode mode;
+        try {
+            mode = Mode.valueOf(m);
+        } catch (Exception e) {
+            mode = Mode.AUTO;
+        }
+
+        return count(hCtx, parquetFile, mode);
+    }
+
+    /** Count rows with explicit mode. Manages UGI.doAs() internally. */
+    public static Result count(HadoopClientManager.HadoopClientContext hCtx,
+                               String parquetFile,
+                               Mode mode) {
+
+        Objects.requireNonNull(hCtx, "hCtx");
+        Objects.requireNonNull(parquetFile, "parquetFile");
+        Objects.requireNonNull(mode, "mode");
+
+        try {
+            return hCtx.doAs(
+                    (PrivilegedExceptionAction<Result>) () ->
+                            countInCurrentUGI(hCtx, parquetFile, mode)
+            );
+        } catch (Exception e) {
+            throw new RuntimeException(
+                    "Failed to compute Parquet row count for " + parquetFile, e
+            );
+        }
+    }
+
+    /**
+     * Count rows assuming caller is ALREADY inside UGI.doAs().
+     * MUST NOT call doAs() again.
+     */
+    public static Result countInCurrentUGI(HadoopClientManager.HadoopClientContext hCtx,
+                                           String parquetFile,
+                                           Mode mode) throws Exception {
+
+        Configuration conf = hCtx.conf();
+        String fsDefault = conf.get("fs.defaultFS", "file:///");
+        String normalized =
+                ParquetReaderUtil.resolveParquetFilePath(parquetFile, fsDefault);
+
+        Path hPath = new Path(normalized);
+        FileSystem fs = newFileSystemInCurrentUGI(conf, hPath);
+
+        try {
+            if (!fs.exists(hPath)) {
+                throw new IllegalArgumentException(
+                        "Parquet file does not exist: " + normalized
+                );
+            }
+
+            Long metadataCount = null;
+            if (mode == Mode.AUTO || mode == Mode.METADATA) {
+                metadataCount = metadataCount(conf, fs, hPath);
+                if (metadataCount != null) {
+                    return new Result(metadataCount, "METADATA", normalized);
+                }
+                if (mode == Mode.METADATA) {
+                    throw new IllegalStateException(
+                            "Metadata row count unavailable for " + normalized
+                    );
+                }
+            }
+
+            long scanned = scanCount(conf, hPath);
+            return new Result(scanned, "SCAN", normalized);
+
+        } finally {
+            try {
+                fs.close();
+            } catch (Exception ignore) {
+                // no-op
+            }
+        }
+    }
+
+    /**
+     * Create FileSystem under CURRENT UGI.
+     *
+     * CRITICAL GUARDFS:
+     *  - Never allow resolved URI to be "file:"
+     *  - Always let Hadoop resolve FS from fs.defaultFS
+     */
+    public static FileSystem newFileSystemInCurrentUGI(Configuration conf,
+                                                       Path path) throws Exception {
+
+        FileSystem fs = FileSystem.newInstance(conf);
+        URI resolved = fs.getUri();
+
+        LOG.info(
+                "Resolved Hadoop FileSystem (RowCount): uri={}, scheme={}, authority={}, fs.defaultFS={}, path={}",
+                resolved,
+                resolved.getScheme(),
+                resolved.getAuthority(),
+                conf.get("fs.defaultFS"),
+                path
+        );
+
+        // 🔒 GUARD ASSERTION — FAIL FAST
+        if ("file".equals(resolved.getScheme())
+                && (resolved.getSchemeSpecificPart() == null
+                || resolved.getSchemeSpecificPart().isBlank())
+        ) {
+            throw new IllegalStateException(
+                    "Invalid Hadoop FileSystem URI resolved: '" + resolved
+                            + "' — expected file:/// (not file:)"
+            );
+        }
+
+        return fs;
+    }
+
+    private static Long metadataCount(Configuration conf,
+                                      FileSystem fs,
+                                      Path hPath) {
+
+        try {
+            ParquetMetadata metadata =
+                    ParquetFooterCache.readFooterCached(conf, fs, hPath);
+            if (metadata == null) return null;
+
+            List<BlockMetaData> blocks = metadata.getBlocks();
+            if (blocks == null || blocks.isEmpty()) return null;
+
+            long sum = 0L;
+            for (BlockMetaData b : blocks) {
+                long rc = b.getRowCount();
+                if (rc <= 0) return null;
+                sum += rc;
+            }
+            return sum > 0 ? sum : null;
+        } catch (Exception ex) {
+            return null;
+        }
+    }
+
+    private static long scanCount(Configuration conf, Path hPath)
+            throws Exception {
+
+        long rows = 0L;
+        try (ParquetReader<Group> reader =
+                     ParquetReader.builder(new GroupReadSupport(), hPath)
+                             .withConf(conf)
+                             .build()) {
+            while (reader.read() != null) {
+                rows++;
+            }
+        }
+        return rows;
+    }
+}
