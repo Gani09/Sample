@@ -1,0 +1,46 @@
+package com.fiserv.fef.exceptions;
+
+/**
+ * Exception for Gherkin execution errors
+ */
+public class GherkinExecutionException extends FEFValidationException {
+    
+    private String featureId;
+    private String scenarioName;
+    private String stepText;
+    
+    public GherkinExecutionException(String message) {
+        super(message);
+    }
+    
+    public GherkinExecutionException(String message, Throwable cause) {
+        super(message, cause);
+    }
+    
+    public GherkinExecutionException(String message, String featureId, String scenarioName) {
+        super(message);
+        this.featureId = featureId;
+        this.scenarioName = scenarioName;
+    }
+    
+    public GherkinExecutionException(String message, String featureId, String scenarioName, String stepText) {
+        super(message);
+        this.featureId = featureId;
+        this.scenarioName = scenarioName;
+        this.stepText = stepText;
+    }
+    
+    public String getFeatureId() { return featureId; }
+    public String getScenarioName() { return scenarioName; }
+    public String getStepText() { return stepText; }
+    
+    @Override
+    public String toString() {
+        return "GherkinExecutionException{" +
+                "featureId='" + featureId + '\'' +
+                ", scenario='" + scenarioName + '\'' +
+                ", step='" + stepText + '\'' +
+                ", message='" + getMessage() + '\'' +
+                '}';
+    }
+}
