@@ -1,0 +1,230 @@
+package com.fiserv.fef.gherkin;
+
+import com.fiserv.fef.exceptions.GherkinExecutionException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+/**
+ * Parser for Gherkin feature files
+ * Converts Gherkin text into ParsedFeature objects
+ */
+public class FeatureParser {
+
+    private static final Logger LOG = LoggerFactory.getLogger(FeatureParser.class);
+
+    // Gherkin keywords
+    private static final Pattern FEATURE_PATTERN = Pattern.compile("^Feature:\\s*(.+)$", Pattern.MULTILINE);
+    private static final Pattern SCENARIO_PATTERN = Pattern.compile("^\\s*Scenario:\\s*(.+)$", Pattern.MULTILINE);
+    private static final Pattern STEP_PATTERN = Pattern.compile("^\\s*(Given|When|Then|And|But)\\s+(.+)$", Pattern.MULTILINE);
+
+    /**
+     * Parse Gherkin feature text
+     */
+    public ParsedFeature parse(String featureText) {
+        LOG.debug("Parsing Gherkin feature");
+
+        if (featureText == null || featureText.trim().isEmpty()) {
+            throw new GherkinExecutionException("Feature text is empty");
+        }
+
+        try {
+            // Extract feature name
+            String featureName = extractFeatureName(featureText);
+            ParsedFeature feature = new ParsedFeature(featureName);
+
+            // Extract scenarios
+            List<ParsedScenario> scenarios = extractScenarios(featureText);
+            feature.setScenarios(scenarios);
+
+            LOG.debug("Parsed feature: name={}, scenarios={}", featureName, scenarios.size());
+
+            return feature;
+
+        } catch (Exception e) {
+            LOG.error("Failed to parse Gherkin feature", e);
+            throw new GherkinExecutionException("Failed to parse Gherkin feature", e);
+        }
+    }
+
+    /**
+     * Extract feature name from text
+     */
+    private String extractFeatureName(String featureText) {
+        Matcher matcher = FEATURE_PATTERN.matcher(featureText);
+
+        if (matcher.find()) {
+            return matcher.group(1).trim();
+        }
+
+        throw new GherkinExecutionException("No feature declaration found");
+    }
+
+    /**
+     * Extract all scenarios from text
+     */
+    private List<ParsedScenario> extractScenarios(String featureText) {
+        List<ParsedScenario> scenarios = new ArrayList<>();
+
+        // Split by scenarios
+        String[] parts = featureText.split("(?=Scenario:)");
+
+        for (String part : parts) {
+            if (part.trim().startsWith("Scenario:")) {
+                ParsedScenario scenario = parseScenario(part);
+                if (scenario != null) {
+                    scenarios.add(scenario);
+                }
+            }
+        }
+
+        return scenarios;
+    }
+
+    /**
+     * Parse single scenario
+     */
+    private ParsedScenario parseScenario(String scenarioText) {
+        // Extract scenario name
+        Matcher scenarioMatcher = SCENARIO_PATTERN.matcher(scenarioText);
+
+        if (!scenarioMatcher.find()) {
+            return null;
+        }
+
+        String scenarioName = scenarioMatcher.group(1).trim();
+        ParsedScenario scenario = new ParsedScenario(scenarioName);
+
+        // Extract steps
+        List<ParsedStep> steps = extractSteps(scenarioText);
+        scenario.setSteps(steps);
+
+        return scenario;
+    }
+
+    /**
+     * Extract all steps from scenario text
+     */
+    private List<ParsedStep> extractSteps(String scenarioText) {
+        List<ParsedStep> steps = new ArrayList<>();
+
+        String[] lines = scenarioText.split("\n");
+        ParsedStep currentStep = null;
+        List<List<String>> currentDataTable = null;
+        boolean inDataTable = false;
+
+        for (String line : lines) {
+            String trimmedLine = line.trim();
+
+            // Skip empty lines and scenario line
+            if (trimmedLine.isEmpty() || trimmedLine.startsWith("Scenario:")) {
+                continue;
+            }
+
+            // Check if this is a step line
+            Matcher stepMatcher = STEP_PATTERN.matcher(line);
+            if (stepMatcher.matches()) {
+                // Save previous step if exists
+                if (currentStep != null) {
+                    if (currentDataTable != null && !currentDataTable.isEmpty()) {
+                        currentStep.setDataTable(currentDataTable);
+                    }
+                    steps.add(currentStep);
+                }
+
+                // Start new step
+                String keyword = stepMatcher.group(1);
+                String text = stepMatcher.group(2).trim();
+
+                currentStep = new ParsedStep(keyword, text);
+
+                // Extract arguments (strings in quotes)
+                List<String> arguments = extractArguments(text);
+                currentStep.setArguments(arguments);
+
+                // Reset data table
+                currentDataTable = null;
+                inDataTable = false;
+
+            } else if (trimmedLine.startsWith("|")) {
+                // This is a data table row
+                if (!inDataTable) {
+                    currentDataTable = new ArrayList<>();
+                    inDataTable = true;
+                }
+
+                // Parse table row
+                List<String> row = parseDataTableRow(trimmedLine);
+                currentDataTable.add(row);
+            }
+        }
+
+        // Add last step
+        if (currentStep != null) {
+            if (currentDataTable != null && !currentDataTable.isEmpty()) {
+                currentStep.setDataTable(currentDataTable);
+            }
+            steps.add(currentStep);
+        }
+
+        return steps;
+    }
+
+    /**
+     * Parse a data table row (pipe-separated values)
+     */
+    private List<String> parseDataTableRow(String line) {
+        List<String> cells = new ArrayList<>();
+
+        // Remove leading and trailing pipes, then split by pipe
+        String content = line.trim();
+        if (content.startsWith("|")) {
+            content = content.substring(1);
+        }
+        if (content.endsWith("|")) {
+            content = content.substring(0, content.length() - 1);
+        }
+
+        // Split by pipe and trim each cell
+        String[] parts = content.split("\\|");
+        for (String part : parts) {
+            cells.add(part.trim());
+        }
+
+        return cells;
+    }
+
+    /**
+     * Extract arguments from step text (strings in quotes)
+     */
+    private List<String> extractArguments(String stepText) {
+        List<String> arguments = new ArrayList<>();
+
+        // Pattern for strings in double quotes
+        Pattern argPattern = Pattern.compile("\"([^\"]*)\"");
+        Matcher matcher = argPattern.matcher(stepText);
+
+        while (matcher.find()) {
+            arguments.add(matcher.group(1));
+        }
+
+        return arguments;
+    }
+
+    /**
+     * Validate feature structure
+     */
+    public boolean validate(String featureText) {
+        try {
+            parse(featureText);
+            return true;
+        } catch (Exception e) {
+            LOG.warn("Feature validation failed", e);
+            return false;
+        }
+    }
+}
