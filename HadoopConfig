@@ -1,0 +1,301 @@
+package com.fiserv.fef.hadoop;
+
+import com.fiserv.fef.utils.PropertiesUtil;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.security.UserGroupInformation;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.net.URI;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.security.PrivilegedExceptionAction;
+import java.util.*;
+
+public final class HadoopConfig {
+
+    private static final Logger LOG = LoggerFactory.getLogger(HadoopConfig.class);
+
+    // Default mounts used in your OpenShift YAMLs
+    private static final String DEFAULT_HADOOP_CONF_DIR = "/work/etc/hadoop/conf.cloudera.hdfs";
+    private static final String DEFAULT_KRB5_CONF = "/work/etc/krb5_commdev.conf.d/krb5_commdev.conf";
+    private static final String DEFAULT_KEYTAB = "/work/etc/krb5_commdev.conf.d/shortname-cloudera.keytab";
+
+    /**
+     * Recoverable guard (don’t get stuck forever after a bad first init)
+     */
+    private static volatile boolean kerberosInitialized = false;
+
+    private HadoopConfig() {
+    }
+
+    public static Configuration create(String fsDefault) throws Exception {
+        if (fsDefault == null || fsDefault.isBlank()) {
+            fsDefault = "file:///";
+        }
+
+        // tolerate common typo
+        if (fsDefault.startsWith("fill://")) {
+            fsDefault = "file://" + fsDefault.substring("fill://".length());
+        }
+
+        fsDefault = normalizeFsDefault(fsDefault);
+        String scheme = schemeOf(fsDefault);
+
+        // Start with no default resources; we will add what we need explicitly.
+        Configuration conf = new Configuration(false);
+
+        // Always set impls (safe for all schemes)
+        conf.set("fs.hdfs.impl", "org.apache.hadoop.hdfs.DistributedFileSystem");
+        conf.set("fs.file.impl", "org.apache.hadoop.fs.LocalFileSystem");
+
+        LOG.info("fs.defaultFS={}", fsDefault);
+        LOG.info("scheme={}", scheme);
+
+        if ("hdfs".equalsIgnoreCase(scheme) || "viewfs".equalsIgnoreCase(scheme)) {
+
+            String hadoopConfDir = resolveHadoopConfDir();
+            addHadoopResources(conf, hadoopConfDir);
+
+            // Set fs.defaultFS AFTER loading XML resources to ensure deterministic precedence
+            conf.set("fs.defaultFS", fsDefault);
+
+            // For parallel scenario execution + Flink thread pools, avoid global FS cache bleed
+            conf.setBoolean("fs.hdfs.impl.disable.cache", true);
+            LOG.warn("fs.hdfs.impl.disable.cache=true (forced for parallel scenario safety)");
+
+            // Keep your existing property-based behavior too
+            applyOptionalFsCacheSettings(conf);
+
+            requireHdfsConfigsLoaded(conf, hadoopConfDir);
+
+            if ("hdfs".equalsIgnoreCase(scheme)) {
+                validateHaConfig(conf, fsDefault);
+            } else {
+                LOG.info("viewfs:// detected. Skipping strict nameservice-host validation.");
+            }
+
+            initKerberosIfNeeded(conf);
+            warmUpHdfsFileSystem(conf);
+
+        } else if ("file".equalsIgnoreCase(scheme)) {
+
+            conf.set("fs.defaultFS", fsDefault);
+            LOG.info("Local filesystem selected (file://). Hadoop/Kerberos disabled.");
+
+        } else {
+            throw new IllegalArgumentException("Unsupported filesystem URI: " + fsDefault);
+        }
+
+        return conf;
+    }
+
+    private static String normalizeFsDefault(String fsDefault) {
+        String s = fsDefault.trim();
+        if (!s.contains("://") && s.startsWith("/")) {
+            return "file:///" + s.substring(1);
+        }
+        if (s.startsWith("file:/") && !s.startsWith("file:///")) {
+            return "file:///" + s.substring("file:/".length());
+        }
+        return s;
+    }
+
+    private static String schemeOf(String uri) {
+        try {
+            URI u = URI.create(uri);
+            String scheme = u.getScheme();
+            return (scheme == null || scheme.isBlank()) ? "file" : scheme;
+        } catch (Exception e) {
+            return "file";
+        }
+    }
+
+    private static String resolveHadoopConfDir() {
+        String env = System.getenv("HADOOP_CONF_DIR");
+        if (env != null && !env.isBlank()) return env;
+        try {
+            PropertiesUtil props = PropertiesUtil.getInstance();
+            String p = props.getProperty("hadoop.conf.dir", "");
+            if (p != null && !p.isBlank()) return p;
+        } catch (Throwable ignored) {
+        }
+        return DEFAULT_HADOOP_CONF_DIR;
+    }
+
+    private static void addHadoopResources(Configuration conf, String hadoopConfDir) {
+        if (!Files.isReadable(Paths.get(hadoopConfDir, "core-site.xml")) ||
+                !Files.isReadable(Paths.get(hadoopConfDir, "hdfs-site.xml"))) {
+            LOG.warn("Hadoop config files are not readable under {} (core-site.xml/hdfs-site.xml).", hadoopConfDir);
+        }
+        conf.addResource(new Path(hadoopConfDir, "core-site.xml"));
+        conf.addResource(new Path(hadoopConfDir, "hdfs-site.xml"));
+        LOG.info("Loaded Hadoop resources from dir={} (core-site.xml, hdfs-site.xml)", hadoopConfDir);
+    }
+
+    private static void applyOptionalFsCacheSettings(Configuration conf) {
+        try {
+            PropertiesUtil props = PropertiesUtil.getInstance();
+            boolean disableCache = Boolean.parseBoolean(props.getProperty("hdfs.disable.cache", "false"));
+            if (disableCache) {
+                conf.setBoolean("fs.hdfs.impl.disable.cache", true);
+                LOG.warn("fs.hdfs.impl.disable.cache=true (enabled via hdfs.disable.cache). This reduces FS reuse/perf.");
+            }
+        } catch (Throwable t) {
+            LOG.debug("applyOptionalFsCacheSettings skipped: {}", t.toString());
+        }
+    }
+
+    private static void requireHdfsConfigsLoaded(Configuration conf, String hadoopConfDir) {
+        String auth = trimToEmpty(conf.get("hadoop.security.authentication"));
+        String ns = trimToEmpty(conf.get("dfs.nameservices"));
+        if (auth.isEmpty()) {
+            throw new IllegalStateException(
+                    "HDFS selected but Hadoop configs appear not loaded: missing hadoop.security.authentication. " +
+                            "Check HADOOP_CONF_DIR=" + hadoopConfDir);
+        }
+        if (ns.isEmpty()) {
+            throw new IllegalStateException(
+                    "HDFS selected but Hadoop configs appear not loaded: missing dfs.nameservices. " +
+                            "Check HADOOP_CONF_DIR=" + hadoopConfDir);
+        }
+        LOG.info("hadoop.security.authentication={}", auth);
+        LOG.info("dfs.nameservices={}", ns);
+        LOG.info("hadoop.rpc.protection={}", trimToEmpty(conf.get("hadoop.rpc.protection")));
+    }
+
+    private static void validateHaConfig(Configuration conf, String fsDefault) {
+        String nameservices = trimToEmpty(conf.get("dfs.nameservices"));
+        if (nameservices.isBlank()) {
+            throw new IllegalStateException(
+                    "dfs.nameservices is not set. HA configs not loaded or incomplete. " +
+                            "Verify hdfs-site.xml under HADOOP_CONF_DIR. fs.defaultFS=" + fsDefault);
+        }
+        Set<String> nsSet = new HashSet<>(Arrays.asList(conf.getTrimmedStrings("dfs.nameservices")));
+        for (String ns : nsSet) {
+            String key = "dfs.client.failover.proxy.provider." + ns;
+            String provider = trimToEmpty(conf.get(key));
+            if (provider.isBlank()) {
+                throw new IllegalStateException("HA enabled but failover provider missing: " + key);
+            }
+            LOG.info("{}={}", key, provider);
+        }
+        URI uri = URI.create(fsDefault);
+        String host = uri.getHost();
+        if (host != null && !host.isBlank() && !nsSet.contains(host)) {
+            throw new IllegalArgumentException(
+                    "Physical NameNode URI not allowed when HA is enabled. fs.defaultFS=" + fsDefault +
+                            " — use hdfs://<nameservice> where <nameservice> is one of " + nsSet);
+        }
+    }
+
+    private static void initKerberosIfNeeded(Configuration conf) throws Exception {
+        if (kerberosInitialized) {
+            UserGroupInformation ugi = safeLoginUser();
+            if (ugi != null && ugi.hasKerberosCredentials()) {
+                return;
+            }
+            LOG.warn("Kerberos was marked initialized but credentials are missing/expired. Re-initializing.");
+        }
+
+        synchronized (HadoopConfig.class) {
+            UserGroupInformation ugi = safeLoginUser();
+            if (ugi != null && ugi.hasKerberosCredentials()) {
+                kerberosInitialized = true;
+                return;
+            }
+
+            PropertiesUtil props = PropertiesUtil.getInstance();
+            String principal = trimToEmpty(props.getProperty("kerberos.principal", ""));
+            String keytab = trimToEmpty(props.getProperty("kerberos.keytab", ""));
+            String krb5Conf = trimToEmpty(props.getProperty("krb5.conf.path", DEFAULT_KRB5_CONF));
+            boolean debug = Boolean.parseBoolean(props.getProperty("kerberos.debug", "false"));
+
+            if (principal.isEmpty()) {
+                principal = trimToEmpty(System.getenv("KERBEROS_PRINCIPAL"));
+            }
+            if (keytab.isEmpty()) {
+                keytab = normalizeKeytabEnv(trimToEmpty(System.getenv("KRB5_KTNAME")));
+            }
+            if (keytab.isEmpty()) {
+                keytab = DEFAULT_KEYTAB;
+            }
+
+            String existingKrb5 = System.getProperty("java.security.krb5.conf");
+            if (existingKrb5 == null || existingKrb5.isBlank()) {
+                System.setProperty("java.security.krb5.conf", krb5Conf);
+            }
+            System.setProperty("javax.security.auth.useSubjectCredsOnly", "false");
+
+            if (debug && System.getProperty("sun.security.krb5.debug") == null) {
+                System.setProperty("sun.security.krb5.debug", "true");
+                LOG.warn("Kerberos debug ENABLED (turn off in prod).");
+            }
+
+            if (principal.isEmpty() || keytab.isEmpty()) {
+                throw new IllegalStateException(
+                        "Kerberos required but not configured (principal/keytab). " +
+                                "Set kerberos.principal/kerberos.keytab or env KERBEROS_PRINCIPAL/KRB5_KTNAME.");
+            }
+
+            validateReadableFile("krb5.conf", System.getProperty("java.security.krb5.conf"));
+            validateReadableFile("keytab", keytab);
+
+            UserGroupInformation.setConfiguration(conf);
+
+            LOG.info("Attempting Kerberos login from keytab. principal={}, keytab={}", principal, keytab);
+            UserGroupInformation.loginUserFromKeytab(principal, keytab);
+
+            // NOTE: DO NOT closeAllForUGI() here under parallel scenario execution.
+
+            KerberosRenewer.start();
+
+            kerberosInitialized = true;
+            LOG.info("Kerberos login successful: {}", UserGroupInformation.getLoginUser());
+        }
+    }
+
+    private static String normalizeKeytabEnv(String kt) {
+        if (kt == null) return "";
+        String s = kt.trim();
+        if (s.regionMatches(true, 0, "FILE:", 0, 5)) return s.substring(5);
+        if (s.regionMatches(true, 0, "file:", 0, 5)) return s.substring(5);
+        return s;
+    }
+
+    private static void warmUpHdfsFileSystem(Configuration conf) throws Exception {
+        UserGroupInformation login = UserGroupInformation.getLoginUser();
+        if (login == null) {
+            LOG.warn("Skipping HDFS warm-up: login UGI is null");
+            return;
+        }
+        final URI defaultUri = URI.create(conf.get("fs.defaultFS"));
+        login.doAs((PrivilegedExceptionAction<Void>) () -> {
+            try (FileSystem fs = FileSystem.newInstance(defaultUri, conf)) {
+                fs.getStatus();
+            }
+            return null;
+        });
+        LOG.info("HDFS FileSystem warm-up completed under doAs() for {}", login.getUserName());
+    }
+
+    private static UserGroupInformation safeLoginUser() {
+        try {
+            return UserGroupInformation.getLoginUser();
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    private static void validateReadableFile(String label, String path) {
+        if (path == null || path.isBlank()) throw new IllegalStateException(label + " path is blank");
+        if (!Files.exists(Paths.get(path))) throw new IllegalStateException(label + " does not exist: " + path);
+        if (!Files.isReadable(Paths.get(path))) throw new IllegalStateException(label + " is not readable: " + path);
+    }
+
+    private static String trimToEmpty(String s) {
+        return (s == null) ? "" : s.trim();
+    }
+}
