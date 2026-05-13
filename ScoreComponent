@@ -1,0 +1,62 @@
+package com.fiserv.fef.models;
+
+import java.io.Serializable;
+
+public class ScoreComponent implements Serializable {
+    private static final long serialVersionUID = 1L;
+    private String name;
+    private double value;
+    private String description;
+    private String executionDate;
+    private String processName;
+    private String processID;
+
+    public ScoreComponent() {}
+
+    public ScoreComponent(String name, double value, String description, String executionDate,String processName,String processID) {
+        this.name = name;
+        this.value = value;
+        this.description = description;
+        this.executionDate = executionDate;
+        this.processName = processName;
+        this.processID = processID;
+    }
+
+    public String getName() { return name; }
+    public void setName(String name) { this.name = name; }
+
+    public double getValue() { return value; }
+    public void setValue(double value) { this.value = value; }
+
+    public String getDescription() { return description; }
+    public void setDescription(String description) { this.description = description; }
+
+    public String getExecutionDate() { return executionDate; }
+    public void setExecutionDate(String executionDate) { this.executionDate = this.executionDate; }
+
+    public String getProcessName() {
+        return processName;
+    }
+
+    public void setProcessName(String processName) {
+        this.processName = processName;
+    }
+
+    public String getProcessID() {
+        return processID;
+    }
+
+    public void setProcessID(String processID) {
+        this.processID = processID;
+    }
+
+    @Override
+    public String toString() {
+        return "ScoreComponent{" +
+                "name='" + name + '\'' +
+                ", value=" + value +
+                ", description='" + description + '\'' +
+                ", executedDate='" + executionDate + '\'' +
+                '}';
+    }
+}
