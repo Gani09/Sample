@@ -1,0 +1,80 @@
+package com.fiserv.fef.parquet.validation;
+
+import com.fiserv.fef.parquet.filter.DecimalDecodeCache;
+import com.fiserv.fef.parquet.schema.ParquetSchemaFieldResolver;
+import org.apache.parquet.example.data.Group;
+import org.apache.parquet.io.api.Binary;
+import org.apache.parquet.schema.LogicalTypeAnnotation;
+import org.apache.parquet.schema.PrimitiveType;
+import org.apache.parquet.schema.Type;
+
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+public final class ParquetGroupValueExtractor {
+    private ParquetGroupValueExtractor() {}
+
+    public static Map<String,Object> decodeRow(Group g, ParquetSchemaFieldResolver.OutputFieldPlan plan) {
+        Map<String,Object> row = new LinkedHashMap<>();
+        for (int i = 0; i < plan.aliases.size(); i++) {
+            String alias = plan.aliases.get(i);
+            List<String> paths = plan.candidatePaths.get(i);
+            Object chosen = null;
+            for (String p : paths) {
+                Object v = getValue(g, p);
+                if (v != null) {
+                    if (chosen != null) throw new IllegalStateException("Ambiguous field " + alias);
+                    chosen = v;
+                }
+            }
+            row.put(alias, chosen);
+        }
+        return row;
+    }
+
+    public static Object getValue(Group root, String dotPath) {
+        if (root == null || dotPath == null || dotPath.isEmpty()) return null;
+        String[] segs = dotPath.split("\\.");
+        Group cur = root;
+        for (int i = 0; i < segs.length; i++) {
+            int idx;
+            try { idx = cur.getType().getFieldIndex(segs[i]); }
+            catch (Exception e) { return null; }
+            if (cur.getFieldRepetitionCount(idx) <= 0) return null;
+            Type t = cur.getType().getType(idx);
+            if (i == segs.length - 1) {
+                if (!t.isPrimitive()) return null;
+                return decodePrimitive(cur, idx, 0, t.asPrimitiveType(), dotPath);
+            }
+            if (t.isPrimitive()) return null;
+            cur = cur.getGroup(idx, 0);
+        }
+        return null;
+    }
+
+    private static Object decodePrimitive(Group g, int fieldIndex, int repIndex,
+                                          PrimitiveType pt, String path) {
+        LogicalTypeAnnotation l = pt.getLogicalTypeAnnotation();
+        if (l instanceof LogicalTypeAnnotation.DecimalLogicalTypeAnnotation dec) {
+            Binary b = g.getBinary(fieldIndex, repIndex);
+            return DecimalDecodeCache.decode(path, b, dec.getScale());
+        }
+        switch (pt.getPrimitiveTypeName()) {
+            case BOOLEAN: return g.getBoolean(fieldIndex, repIndex);
+            case INT32: return g.getInteger(fieldIndex, repIndex);
+            case INT64: return g.getLong(fieldIndex, repIndex);
+            case FLOAT: return g.getFloat(fieldIndex, repIndex);
+            case DOUBLE: return g.getDouble(fieldIndex, repIndex);
+            case BINARY:
+            case FIXED_LEN_BYTE_ARRAY:
+                Binary b = g.getBinary(fieldIndex, repIndex);
+                if (l instanceof LogicalTypeAnnotation.StringLogicalTypeAnnotation) {
+                    return b.toStringUsingUTF8();
+                }
+                return b.getBytes();
+            default:
+                return null;
+        }
+    }
+}
