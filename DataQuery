@@ -1,0 +1,98 @@
+package com.fiserv.fef.models;
+
+import org.bson.Document;
+import java.io.Serializable;
+import java.util.HashMap;
+import java.util.Map;
+
+/**
+ * Query specification for data access
+ */
+public class DataQuery implements Serializable {
+    
+    private String collection;
+    private Document filter;
+    private Document projection;
+    private Document sort;
+    private Integer limit;
+    private Integer skip;
+    private Map<String, Object> parameters;
+    
+    // Estimated size for strategy selection
+    private Long estimatedSize;
+    private boolean requiresJoin;
+    private boolean requiresAggregation;
+    
+    public DataQuery() {
+        this.filter = new Document();
+        this.parameters = new HashMap<>();
+    }
+    
+    public DataQuery(String collection) {
+        this();
+        this.collection = collection;
+    }
+    
+    public DataQuery(String collection, Document filter) {
+        this();
+        this.collection = collection;
+        this.filter = filter;
+    }
+    
+    // Builder-style methods
+    public DataQuery withFilter(Document filter) {
+        this.filter = filter;
+        return this;
+    }
+    
+    public DataQuery withProjection(Document projection) {
+        this.projection = projection;
+        return this;
+    }
+    
+    public DataQuery withLimit(int limit) {
+        this.limit = limit;
+        return this;
+    }
+    
+    public DataQuery withSort(Document sort) {
+        this.sort = sort;
+        return this;
+    }
+    
+    public DataQuery withParameter(String key, Object value) {
+        this.parameters.put(key, value);
+        return this;
+    }
+    
+    // Getters and Setters
+    public String getCollection() { return collection; }
+    public void setCollection(String collection) { this.collection = collection; }
+    
+    public Document getFilter() { return filter; }
+    public void setFilter(Document filter) { this.filter = filter; }
+    
+    public Document getProjection() { return projection; }
+    public void setProjection(Document projection) { this.projection = projection; }
+    
+    public Document getSort() { return sort; }
+    public void setSort(Document sort) { this.sort = sort; }
+    
+    public Integer getLimit() { return limit; }
+    public void setLimit(Integer limit) { this.limit = limit; }
+    
+    public Integer getSkip() { return skip; }
+    public void setSkip(Integer skip) { this.skip = skip; }
+    
+    public Map<String, Object> getParameters() { return parameters; }
+    public void setParameters(Map<String, Object> parameters) { this.parameters = parameters; }
+    
+    public Long getEstimatedSize() { return estimatedSize; }
+    public void setEstimatedSize(Long estimatedSize) { this.estimatedSize = estimatedSize; }
+    
+    public boolean isRequiresJoin() { return requiresJoin; }
+    public void setRequiresJoin(boolean requiresJoin) { this.requiresJoin = requiresJoin; }
+    
+    public boolean isRequiresAggregation() { return requiresAggregation; }
+    public void setRequiresAggregation(boolean requiresAggregation) { this.requiresAggregation = requiresAggregation; }
+}
