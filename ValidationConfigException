@@ -1,0 +1,25 @@
+package com.fiserv.fef.exceptions;
+
+/**
+ * Exception for validation configuration errors
+ */
+public class ValidationConfigException extends FEFValidationException {
+    
+    private String validationID;
+
+    public ValidationConfigException(String message) {
+        super(message);
+    }
+    
+    public ValidationConfigException(String message, String validationID) {
+        super(message);
+        this.validationID = validationID;
+    }
+    
+    public ValidationConfigException(String message, String validationID, Throwable cause) {
+        super(message, cause);
+        this.validationID = validationID;
+    }
+    
+    public String getValidationID() { return validationID; }
+}
