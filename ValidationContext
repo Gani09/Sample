@@ -1,0 +1,147 @@
+package com.fiserv.fef.gherkin;
+
+import com.fiserv.fef.models.Dataset;
+import com.fiserv.fef.models.ValidationConfig;
+import com.mongodb.client.MongoClient;
+import com.mongodb.client.MongoDatabase;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * Context shared between step definitions during validation execution
+ * Thread-safe for parallel scenario execution using ConcurrentHashMap
+ * Each scenario should get its own isolated context instance
+ */
+public class ValidationContext {
+    
+    private static final ThreadLocal<ValidationContext> currentContext = new ThreadLocal<>();
+    
+    private ValidationConfig config;
+    private String validationDate;
+    private MongoDatabase tenantDatabase;
+    // Data storage
+    private Map<String, Dataset> datasets;
+    private Map<String, Object> variables;
+    
+    // Clients
+    private MongoClient mongoClient;
+
+    private MongoDatabase srcTenantDatabase;
+    private MongoDatabase targetTenantDatabase;
+
+
+    // Results tracking
+    private Map<String, Object> scenarioResults;
+    
+    public ValidationContext(ValidationConfig config, String validationDate) {
+        this.config = config;
+        this.validationDate = validationDate;
+        this.datasets = new ConcurrentHashMap<>();
+        this.variables = new ConcurrentHashMap<>();
+        this.scenarioResults = new ConcurrentHashMap<>();
+    }
+
+    /**
+     * Create an isolated copy of this context for scenario execution
+     * Shares only the thread-safe resources (MongoClient, Config)
+     * Creates new isolated storage for datasets, variables, and results
+     */
+    public ValidationContext createIsolatedCopy() {
+        ValidationContext copy = new ValidationContext(this.config, this.validationDate);
+        // Share the MongoDB client (thread-safe)
+        copy.setMongoClient(this.mongoClient);
+        // New isolated collections are already created by constructor
+        return copy;
+    }
+    
+    /**
+     * Get current thread's validation context
+     */
+    public static ValidationContext getCurrent() {
+        return currentContext.get();
+    }
+    
+    /**
+     * Set current thread's validation context
+     */
+    public static void setCurrent(ValidationContext context) {
+        currentContext.set(context);
+    }
+    
+    /**
+     * Remove current thread's context (cleanup)
+     */
+    public static void removeCurrent() {
+        currentContext.remove();
+    }
+    
+    // Dataset management
+    public void setDataset(String key, Dataset dataset) {
+        this.datasets.put(key, dataset);
+    }
+    
+    public Dataset getDataset(String key) {
+        return this.datasets.get(key);
+    }
+    
+    public boolean hasDataset(String key) {
+        return this.datasets.containsKey(key);
+    }
+    
+    // Variable management
+    public void setVariable(String key, Object value) {
+        this.variables.put(key, value);
+    }
+    
+    public Object getVariable(String key) {
+        return this.variables.get(key);
+    }
+    
+    public <T> T getVariable(String key, Class<T> type) {
+        Object value = this.variables.get(key);
+        if (value != null && type.isInstance(value)) {
+            return type.cast(value);
+        }
+        return null;
+    }
+    
+    // Result storage
+    public void setScenarioResult(String key, Object value) {
+        this.scenarioResults.put(key, value);
+    }
+    
+    public Object getScenarioResult(String key) {
+        return this.scenarioResults.get(key);
+    }
+    
+    // Getters and Setters
+    public ValidationConfig getConfig() { return config; }
+    public void setConfig(ValidationConfig config) { this.config = config; }
+    
+    public String getValidationDate() { return validationDate; }
+    public void setValidationDate(String validationDate) { this.validationDate = validationDate; }
+    
+    public MongoClient getMongoClient() { return mongoClient; }
+    public void setMongoClient(MongoClient mongoClient) { this.mongoClient = mongoClient; }
+    public MongoDatabase getSrcTenantDatabase() {
+        return srcTenantDatabase;
+    }
+
+    public void setSrcTenantDatabase(MongoDatabase srcTenantDatabase) {
+        this.srcTenantDatabase = srcTenantDatabase;
+    }
+
+    public MongoDatabase getTargetTenantDatabase() {
+        return targetTenantDatabase;
+    }
+
+    public void setTargetTenantDatabase(MongoDatabase targetTenantDatabase) {
+        this.targetTenantDatabase = targetTenantDatabase;
+
+    }
+
+    public Map<String, Dataset> getDatasets() { return datasets; }
+    public Map<String, Object> getVariables() { return variables; }
+    public Map<String, Object> getScenarioResults() { return scenarioResults; }
+}
