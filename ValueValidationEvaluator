@@ -1,0 +1,39 @@
+package com.fiserv.fef.parquet.validation;
+
+import java.util.Optional;
+
+/**
+ * Applies Updated / Unchanged semantics.
+ * Produces ValidationFailure ONLY.
+ * Never throws.
+ */
+public final class ValueValidationEvaluator {
+
+    public static Optional<ValidationFailure> evaluate(
+            Boolean expectedUpdated,
+            boolean equal,
+            String key,
+            String field,
+            Object src,
+            Object tgt) {
+
+        if (expectedUpdated == null) {
+            return equal ? Optional.empty()
+                    : Optional.of(
+                    ValidationFailure.valueMismatch(key, field, src, tgt));
+        }
+
+        if (expectedUpdated) {
+            return equal
+                    ? Optional.of(
+                    ValidationFailure.updatedExpectedButUnchanged(
+                            key, field, src, tgt))
+                    : Optional.empty();
+        }
+
+        return equal ? Optional.empty()
+                : Optional.of(
+                ValidationFailure.notExpectedButChanged(
+                        key, field, src, tgt));
+    }
+}
