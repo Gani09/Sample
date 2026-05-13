@@ -1,0 +1,372 @@
+package com.fiserv.fef.jobs;
+
+import com.fiserv.fef.datasources.ValidationRegistryLoader;
+import com.fiserv.fef.gherkin.*;
+import com.fiserv.fef.jobs.executors.ResultWriter;
+import com.fiserv.fef.models.DataSourceConfig;
+import com.fiserv.fef.models.ValidationConfig;
+import com.fiserv.fef.models.ValidationResult;
+import org.apache.flink.api.common.functions.MapFunction;
+import org.apache.flink.api.java.ExecutionEnvironment;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.List;
+
+/**
+ * Worker Flink job that executes a single validation
+ *
+ * Lifecycle:
+ * 1. Submitted by Main Job with validation config
+ * 2. Loads Gherkin feature from MongoDB
+ * 3. Executes validation using GherkinExecutor
+ * 4. Writes result to MongoDB
+ * 5. Exits
+ *
+ * This job is short-lived - it starts, executes one validation, and stops
+ */
+public class BatchValidationRunner {
+
+    private static final Logger LOG = LoggerFactory.getLogger(BatchValidationRunner.class);
+
+    /**
+     * Serializable MapFunction for validation execution
+     */
+    public static class ValidationMapFunction implements MapFunction<WorkerJobConfig, ValidationResult> {
+        private static final long serialVersionUID = 1L;
+        private static final Logger LOG = LoggerFactory.getLogger(ValidationMapFunction.class);
+
+        @Override
+        public ValidationResult map(WorkerJobConfig jobConfig) throws Exception {
+            // This map function runs on Flink task manager
+            LOG.info("Executing validation in Flink task: {}", jobConfig.getValidationID());
+
+            // Set system properties for MongoDB configuration
+            // This ensures MongoDBClientFactory uses the correct databases
+            if (jobConfig.getMongoUri() != null) {
+                System.setProperty("mongodb.uri", jobConfig.getMongoUri());
+            }
+            if (jobConfig.getMongoDatabase() != null) {
+                System.setProperty("mongodb.database", jobConfig.getMongoDatabase());
+            }
+            if (jobConfig.getMongoFefDatabase() != null) {
+                System.setProperty("mongodb.fef.database", jobConfig.getMongoFefDatabase());
+            }
+            if (jobConfig.getResultsCollection() != null) {
+                System.setProperty("mongodb.collection.results", jobConfig.getResultsCollection());
+            }
+            if (jobConfig.getFeaturesCollection() != null) {
+                System.setProperty("mongodb.collection.features", jobConfig.getFeaturesCollection());
+            }
+
+            // Execute validation
+            ValidationResult result = executeValidation(jobConfig);
+
+            // Write result to MongoDB
+            writeResult(jobConfig, result);
+
+            // Log final result
+            LOG.info("=================================================");
+            LOG.info("Validation Result: {}", result.isPassed() ? "PASSED" : "FAILED");
+            LOG.info("Validation ID: {}", result.getValidationID());
+            LOG.info("Duration: {}ms", result.getDurationMs());
+            LOG.info("=================================================");
+
+            return result;
+        }
+
+        /**
+         * Execute validation
+         */
+        private ValidationResult executeValidation(WorkerJobConfig config) {
+            LOG.info("Executing validation: {}", config.getValidationID());
+
+            long startTime = System.currentTimeMillis();
+
+            try {
+                // Create validation config
+                ValidationConfig validationConfig = createValidationConfig(config);
+
+                // Create validation context
+                ValidationContext context = new ValidationContext(
+                        validationConfig,
+                        config.getValidationDate()
+                );
+                // Resolve source and target tenant databases from config
+                String srcDbName = (config.getSourceDbName() != null && !config.getSourceDbName().isEmpty())
+                        ? config.getSourceDbName() : config.getMongoDatabase();
+                String tgtDbName = (config.getTargetDbName() != null && !config.getTargetDbName().isEmpty())
+                        ? config.getTargetDbName() : config.getMongoDatabase();
+
+                context.setSrcTenantDatabase(com.fiserv.fef.utils.MongoDBClientFactory.getDatabase(srcDbName));
+                context.setTargetTenantDatabase(com.fiserv.fef.utils.MongoDBClientFactory.getDatabase(tgtDbName));
+
+                LOG.info("Using source DB: {}, target DB: {} for validation: {}",
+                        srcDbName, tgtDbName, config.getValidationID());
+
+                // Create MongoDB client and get FEF database explicitly
+                com.mongodb.client.MongoClient mongoClient = com.mongodb.client.MongoClients.create(config.getMongoUri());
+                com.mongodb.client.MongoDatabase fefDatabase = mongoClient.getDatabase(config.getMongoFefDatabase());
+
+                // Create FeatureLoader with explicit FEF database
+                FeatureLoader featureLoader = new FeatureLoader(fefDatabase, config.getFeaturesCollection());
+
+                // Create GherkinExecutor
+                GherkinExecutor gherkinExecutor = new GherkinExecutor(4);
+
+                // Initialize step definitions
+                initializeStepDefinitions(gherkinExecutor);
+
+                // Load feature
+                String featureID = validationConfig.getFeatureID();
+                LOG.info("Loading feature: {} from FEF database: {}", featureID, config.getMongoFefDatabase());
+                String featureText = featureLoader.loadFeature(featureID);
+
+                // Set MongoDB client in context
+                context.setMongoClient(mongoClient);
+
+                // Execute validation
+                ValidationResult result = gherkinExecutor.execute(featureText, context);
+
+                // Set tracking fields
+                result.setProcessID(config.getProcessID());
+                result.setPipelineRunID(config.getPipelineRunID());
+                result.setValidationDate(config.getValidationDate());
+                result.setValidationID(config.getValidationID());
+
+                // Set duration
+                long duration = System.currentTimeMillis() - startTime;
+                result.setDurationMs(duration);
+
+                LOG.info("Validation executed: passed={}, duration={}ms",
+                        result.isPassed(), duration);
+
+                // Close MongoDB client
+                mongoClient.close();
+
+                return result;
+
+            } catch (Exception e) {
+                LOG.error("Validation execution failed", e);
+
+                // Create failure result
+                ValidationResult failureResult = new ValidationResult(config.getValidationID());
+                failureResult.setProcessID(config.getProcessID());
+                failureResult.setPipelineRunID(config.getPipelineRunID());
+                failureResult.setValidationDate(config.getValidationDate());
+                failureResult.setPassed(false);
+                failureResult.setErrorMessage("Execution failed: " + e.getMessage());
+                failureResult.setDurationMs(System.currentTimeMillis() - startTime);
+
+                return failureResult;
+            }
+        }
+
+        /**
+         * Write result to MongoDB FEF database
+         */
+        private void writeResult(WorkerJobConfig config, ValidationResult result) {
+            LOG.info("Writing result to MongoDB FEF database");
+
+            try {
+                ResultWriter writer = new ResultWriter(
+                        config.getMongoUri(),
+                        config.getMongoFefDatabase(),  // Use FEF database for results
+                        config.getResultsCollection()
+                );
+
+                writer.writeResult(result);
+
+                LOG.info("Result written successfully to FEF database");
+
+            } catch (Exception e) {
+                LOG.error("Failed to write result", e);
+                // Don't fail the job if write fails - result is already computed
+            }
+        }
+
+        /**
+         * Initialize step definitions for GherkinExecutor
+         */
+        private void initializeStepDefinitions(GherkinExecutor gherkinExecutor) {
+            LOG.info("Initializing step definitions");
+
+            try {
+                // Scan for step definition classes in stepdefs package
+                java.util.List<Class<?>> stepDefClasses =
+                        StepDefinitionScanner.scanPackage("com.fiserv.fef.stepdefs");
+
+                // Register each class
+                StepDefinitionRegistry registry = gherkinExecutor.getStepRegistry();
+                for (Class<?> stepDefClass : stepDefClasses) {
+                    registry.registerStepDefinitionClass(stepDefClass);
+                    LOG.debug("Registered step definition class: {}", stepDefClass.getSimpleName());
+                }
+
+                LOG.info("Registered {} step definition classes", stepDefClasses.size());
+
+            } catch (Exception e) {
+                LOG.error("Failed to initialize step definitions", e);
+                throw new RuntimeException("Step definition initialization failed", e);
+            }
+        }
+
+        /**
+         * Create ValidationConfig from job config
+         */
+        private ValidationConfig createValidationConfig(WorkerJobConfig config) {
+            ValidationRegistryLoader validationRegistryLoader = new ValidationRegistryLoader();
+            ValidationConfig validationConfig = new ValidationConfig();
+
+            // Fix: Use setValidationID instead of setValidationId
+            validationConfig.setValidationID(config.getValidationID());
+            // Fix: Use getFeatureID instead of getFeatureId
+            validationConfig.setFeatureID(config.getFeatureID());
+            validationConfig.setEnabled(true);
+            List<DataSourceConfig> targetDataSources = validationRegistryLoader.loadDataSourceConfigs(config.getProcessID(), config.getValidationID());
+            validationConfig.setTargetDataSources(targetDataSources);
+            return validationConfig;
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        LOG.info("=================================================");
+        LOG.info("Starting FEF Worker Validation Job");
+        LOG.info("=================================================");
+
+        // Parse arguments
+        WorkerJobConfig config = parseArguments(args);
+
+        LOG.info("Worker job configuration: {}", config);
+
+        // Create Flink execution environment
+        ExecutionEnvironment env = ExecutionEnvironment.getExecutionEnvironment();
+
+        // IMPORTANT: Wrap validation in Flink operations
+        // Create a single-element source with the config
+        env.fromElements(config)
+                .map(new ValidationMapFunction())
+                .output(new org.apache.flink.api.java.io.DiscardingOutputFormat<>())
+                .setParallelism(1);
+
+        // Execute the Flink job - this creates the job graph
+        // Use the descriptive job name from JobSubmitter if provided
+        String executionName = config.getJobName() != null ? config.getJobName()
+                : "FEF Worker: " + config.getValidationID();
+
+        LOG.info("Executing Flink job with name: {}", executionName);
+        env.execute(executionName);
+    }
+
+    /**
+     * Parse command line arguments
+     */
+    private static WorkerJobConfig parseArguments(String[] args) {
+        WorkerJobConfig config = new WorkerJobConfig();
+
+        for (int i = 0; i < args.length; i++) {
+            switch (args[i]) {
+                case "--validation-id":
+                    config.setValidationID(args[++i]);
+                    break;
+                case "--process-id":
+                    config.setProcessID(args[++i]);
+                    break;
+                case "--pipeline-run-id":
+                    config.setPipelineRunID(args[++i]);
+                    break;
+                case "--validation-date":
+                    config.setValidationDate(args[++i]);
+                    break;
+                case "--feature-id":
+                    config.setFeatureID(args[++i]);
+                    break;
+                case "--mongo-uri":
+                    config.setMongoUri(args[++i]);
+                    break;
+                case "--mongo-database":
+                    config.setMongoDatabase(args[++i]);
+                    break;
+                case "--mongo-fef-database":
+                    config.setMongoFefDatabase(args[++i]);
+                    break;
+                case "--results-collection":
+                    config.setResultsCollection(args[++i]);
+                    break;
+                case "--features-collection":
+                    config.setFeaturesCollection(args[++i]);
+                    break;
+                case "--source-db-name":
+                    config.setSourceDbName(args[++i]);
+                    break;
+                case "--target-db-name":
+                    config.setTargetDbName(args[++i]);
+                    break;
+
+                    // Accept extra metadata arguments passed by JobSubmitter.buildJobArguments(...)
+                case "--process-name":
+                case "--val-description":
+                case "--val-name":
+                case "--step-number":
+                case "--track":
+                case "--orchestration":
+                case "--created-at":
+                case "--enabled":
+                case "--execution-profiles":
+                    // Currently not used by WorkerJobConfig/runner; consume the value to avoid warnings.
+                    if (i + 1 < args.length && !args[i + 1].startsWith("--")) {
+                        i++;
+                    }
+                    break;
+
+                case "--job-name":
+                    config.setJobName(args[++i]);
+                    break;
+
+                default:
+                    LOG.warn("Unknown argument: {}", args[i]);
+            }
+        }
+
+        // Load from environment if not provided
+        if (config.getMongoUri() == null) {
+            config.setMongoUri(System.getenv().getOrDefault(
+                    "MONGODB_URI", "mongodb://localhost:27017"
+            ));
+        }
+
+        if (config.getMongoDatabase() == null) {
+            config.setMongoDatabase(System.getenv().getOrDefault(
+                    "MONGODB_DATABASE", "Optis_Dev"
+            ));
+        }
+
+        if (config.getMongoFefDatabase() == null) {
+            config.setMongoFefDatabase(System.getenv().getOrDefault(
+                    "MONGODB_FEF_DATABASE", "Optis_fef_config_db"
+            ));
+        }
+
+        // Set default collection names if not provided
+        if (config.getResultsCollection() == null) {
+            config.setResultsCollection(System.getenv().getOrDefault(
+                    "MONGODB_COLLECTION_RESULTS", "fef_validation_results"
+            ));
+        }
+
+        if (config.getFeaturesCollection() == null) {
+            config.setFeaturesCollection(System.getenv().getOrDefault(
+                    "MONGODB_COLLECTION_FEATURES", "fef_validation_features"
+            ));
+        }
+
+        // Validate required arguments
+        if (config.getValidationID() == null || config.getValidationDate() == null) {
+            throw new IllegalArgumentException(
+                    "Required arguments: --validation-id, --validation-date"
+            );
+        }
+
+        return config;
+    }
+}
