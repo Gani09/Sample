@@ -1,0 +1,273 @@
+package com.fiserv.fef.gherkin;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.lang.reflect.Method;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+/**
+ * Registry for step definitions
+ * Manages step definition methods and matches them to Gherkin steps
+ */
+public class StepDefinitionRegistry {
+
+    private static final Logger LOG = LoggerFactory.getLogger(StepDefinitionRegistry.class);
+
+    // Map of pattern -> step definition
+    private final Map<Pattern, StepDefinitionMethod> stepDefinitions;
+
+    // Cache for faster lookups
+    private final Map<String, StepDefinitionMatch> matchCache;
+
+    private final List<Runnable> beforeHooks = new ArrayList<>();
+    private final List<Runnable> afterHooks  = new ArrayList<>();
+
+    public StepDefinitionRegistry() {
+        this.stepDefinitions = new ConcurrentHashMap<>();
+        this.matchCache = new ConcurrentHashMap<>();
+
+        LOG.info("StepDefinitionRegistry initialized");
+    }
+
+    /**
+     * Register step definition class
+     * Scans for @Given, @When, @Then annotated methods
+     */
+    public void registerStepDefinitionClass(Class<?> stepDefClass) {
+        LOG.info("Registering step definition class: {}", stepDefClass.getSimpleName());
+
+        try {
+            Object instance = stepDefClass.getDeclaredConstructor().newInstance();
+
+            int methodCount = 0;
+            for (Method method : stepDefClass.getDeclaredMethods()) {
+                if (registerStepMethod(instance, method)) {
+                    methodCount++;
+                }
+            }
+
+            LOG.info("Registered {} step methods from class: {}", methodCount, stepDefClass.getSimpleName());
+
+        } catch (Exception e) {
+            LOG.error("Failed to register step definition class: {}", stepDefClass.getName(), e);
+        }
+    }
+
+    /**
+     * Register individual step method
+     * @return true if method was registered, false otherwise
+     */
+    private boolean registerStepMethod(Object instance, Method method) {
+
+        // ---------------------------------------------
+        // 1. HOOKS FIRST (they are NOT steps)
+        // ---------------------------------------------
+
+        if (method.isAnnotationPresent(
+                com.fiserv.fef.gherkin.annotations.Before.class)) {
+
+            method.setAccessible(true);
+            beforeHooks.add(() -> invoke(instance, method));
+
+            LOG.debug("Registered @Before hook: {}.{}()",
+                    instance.getClass().getSimpleName(),
+                    method.getName());
+
+            return false;
+        }
+
+        if (method.isAnnotationPresent(
+                com.fiserv.fef.gherkin.annotations.After.class)) {
+
+            method.setAccessible(true);
+            afterHooks.add(() -> invoke(instance, method));
+
+            LOG.debug("Registered @After hook: {}.{}()",
+                    instance.getClass().getSimpleName(),
+                    method.getName());
+
+            return false;
+        }
+
+        // ---------------------------------------------
+        // 2. STEP DEFINITIONS
+        // ---------------------------------------------
+
+        String pattern = null;
+        String type = null;
+
+        if (method.isAnnotationPresent(
+                com.fiserv.fef.gherkin.annotations.Given.class)) {
+
+            pattern = method
+                    .getAnnotation(com.fiserv.fef.gherkin.annotations.Given.class)
+                    .value();
+            type = "Given";
+
+        } else if (method.isAnnotationPresent(
+                com.fiserv.fef.gherkin.annotations.When.class)) {
+
+            pattern = method
+                    .getAnnotation(com.fiserv.fef.gherkin.annotations.When.class)
+                    .value();
+            type = "When";
+
+        } else if (method.isAnnotationPresent(
+                com.fiserv.fef.gherkin.annotations.Then.class)) {
+
+            pattern = method
+                    .getAnnotation(com.fiserv.fef.gherkin.annotations.Then.class)
+                    .value();
+            type = "Then";
+
+        } else if (method.isAnnotationPresent(
+                com.fiserv.fef.gherkin.annotations.And.class)) {
+
+            pattern = method
+                    .getAnnotation(com.fiserv.fef.gherkin.annotations.And.class)
+                    .value();
+            type = "And";
+        }
+
+        // ---------------------------------------------
+        // 3. REGISTER STEP (if applicable)
+        // ---------------------------------------------
+
+        if (pattern != null) {
+
+            method.setAccessible(true);
+
+            Pattern regex = convertCucumberPatternToRegex(pattern);
+
+            StepDefinitionMethod stepDef =
+                    new StepDefinitionMethod(instance, method, pattern, type);
+
+            stepDefinitions.put(regex, stepDef);
+
+            LOG.debug("Registered {} step: '{}' → {}.{}()",
+                    type,
+                    pattern,
+                    instance.getClass().getSimpleName(),
+                    method.getName());
+
+            return true;
+        }
+
+        // ---------------------------------------------
+        // 4. Not a hook, not a step
+        // ---------------------------------------------
+        return false;
+    }
+
+    /**
+     * Find matching step definition for a step
+     */
+    public StepDefinitionMatch findMatch(ParsedStep step) {
+        String stepText = step.getText();
+
+        LOG.debug("Looking for match for step: '{}'", stepText);
+
+        // Try exact match first
+        for (Map.Entry<Pattern, StepDefinitionMethod> entry : stepDefinitions.entrySet()) {
+            Pattern pattern = entry.getKey();
+            StepDefinitionMethod stepDef = entry.getValue();
+
+            Matcher matcher = pattern.matcher(stepText);
+
+            LOG.debug("  Trying pattern: '{}' [regex: {}]", stepDef.getPattern(), pattern.pattern());
+
+            if (matcher.matches()) {
+                // Extract arguments
+                List<String> arguments = new ArrayList<>();
+                for (int i = 1; i <= matcher.groupCount(); i++) {
+                    arguments.add(matcher.group(i));
+                }
+
+                StepDefinitionMatch match = new StepDefinitionMatch(stepDef, arguments, step);
+
+                LOG.info("Matched step: '{}' -> '{}'", stepText, stepDef.getPattern());
+
+                return match;
+            }
+        }
+
+        LOG.warn("No step definition match found for: '{}'", stepText);
+        LOG.warn("Available patterns ({}):", stepDefinitions.size());
+        for (StepDefinitionMethod stepDef : stepDefinitions.values()) {
+            LOG.warn("  - '{}'", stepDef.getPattern());
+        }
+
+        return null;
+    }
+
+    /**
+     * Convert Cucumber pattern to Java regex
+     * Examples:
+     * - "I load {string}" -> "I load \"([^\"]*)\""
+     * - "I have {int} records" -> "I have (\\d+) records"
+     */
+    private Pattern convertCucumberPatternToRegex(String cucumberPattern) {
+        // Escape regex special characters except curly braces and quotes
+        String regex = cucumberPattern.replaceAll("([.\\\\^$|?*+\\[\\]])", "\\\\$1");
+
+        // Replace Cucumber expressions with regex groups
+        regex = regex.replace("{int}", "(\\d+)")
+                .replace("{long}", "(\\d+)")
+                .replace("{double}", "([\\d.]+)")
+                .replace("{word}", "(\\w+)")
+                .replace("{string}", "\"([^\"]*)\"");
+
+
+        LOG.debug("Converted Cucumber pattern '{}' to regex: '{}'", cucumberPattern, regex);
+
+        return Pattern.compile(regex);
+    }
+
+    /**
+     * Get count of registered step definitions
+     */
+    public int getStepDefinitionCount() {
+        return stepDefinitions.size();
+    }
+
+    /**
+     * Clear cache
+     */
+    public void clearCache() {
+        matchCache.clear();
+    }
+
+    public void runBeforeHooks() {
+        beforeHooks.forEach(Runnable::run);
+    }
+
+    public void runAfterHooks() {
+        afterHooks.forEach(Runnable::run);
+    }
+
+    /**
+     * Get all registered patterns (for debugging)
+     */
+    public List<String> getRegisteredPatterns() {
+        return stepDefinitions.values().stream()
+                .map(StepDefinitionMethod::getPattern)
+                .collect(java.util.stream.Collectors.toList());
+    }
+
+    private void invoke(Object instance, Method method) {
+        try {
+            method.invoke(instance);
+        } catch (Exception e) {
+            throw new RuntimeException(
+                    "Failed invoking " +
+                            instance.getClass().getSimpleName() +
+                            "." + method.getName(),
+                    e
+            );
+        }
+    }
+}
