@@ -1,0 +1,87 @@
+package com.fiserv.fef.models;
+
+import org.bson.Document;
+import java.io.Serializable;
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.List;
+import java.util.stream.Stream;
+
+/**
+ * Generic dataset wrapper for both MongoDB documents and other data types
+ * Provides unified interface regardless of data source
+ */
+public class Dataset implements Serializable, Iterable<Document> {
+    
+    private List<Document> documents;
+    private String collection;
+    private long totalCount;
+    
+    public Dataset() {
+        this.documents = new ArrayList<>();
+    }
+    
+    public Dataset(String collection) {
+        this();
+        this.collection = collection;
+    }
+    
+    public Dataset(List<Document> documents, String collection) {
+        this.documents = documents;
+        this.collection = collection;
+        this.totalCount = documents.size();
+    }
+    
+    public void addDocument(Document doc) {
+        this.documents.add(doc);
+        this.totalCount++;
+    }
+    
+    public void addAll(List<Document> docs) {
+        this.documents.addAll(docs);
+        this.totalCount += docs.size();
+    }
+    
+    public Stream<Document> stream() {
+        return documents.stream();
+    }
+    
+    public Stream<Document> parallelStream() {
+        return documents.parallelStream();
+    }
+    
+    @Override
+    public Iterator<Document> iterator() {
+        return documents.iterator();
+    }
+    
+    public int size() {
+        return documents.size();
+    }
+    
+    public boolean isEmpty() {
+        return documents.isEmpty();
+    }
+    
+    public Document get(int index) {
+        return documents.get(index);
+    }
+    
+    // Getters and Setters
+    public List<Document> getDocuments() { return documents; }
+    public void setDocuments(List<Document> documents) { 
+        this.documents = documents;
+        this.totalCount = documents.size();
+    }
+    
+    public String getCollection() { return collection; }
+    public void setCollection(String collection) { this.collection = collection; }
+    
+    public long getTotalCount() { return totalCount; }
+    public void setTotalCount(long totalCount) { this.totalCount = totalCount; }
+    
+    @Override
+    public String toString() {
+        return "Dataset{collection='" + collection + "', size=" + size() + ", total=" + totalCount + "}";
+    }
+}
