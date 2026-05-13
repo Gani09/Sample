@@ -1,0 +1,49 @@
+package com.fiserv.fef.parquet.filter;
+
+import java.util.*;
+
+/**
+ * FilterSpec describes one filter predicate.
+ *
+ *  - For record.match.anywhere:
+ *  - If matchAnywhere=true and the user supplies a short key (no dot-path),
+ *    resolvedPaths may contain multiple candidate dot-paths.
+ *  - Matcher will treat the filter as satisfied if ANY candidate path matches.
+ */
+public final class FilterSpec {
+
+    /** original token from gherkin/filter string */
+    public final String originalKey;
+
+    /** resolved dot-path candidates in schema (one or many) */
+    public final List<String> resolvedPaths;
+
+    /** equality-only for now (kept for future extension) */
+    public final String op;
+
+    /** raw expected value from input */
+    public final String expectedRaw;
+
+    /** typed expected value (optional; may be null) */
+    public final Object expectedTyped;
+
+    /** if true, short keys can match anywhere; matcher tries all resolvedPaths */
+    public final boolean matchAnywhere;
+
+    public FilterSpec(String originalKey,
+                      List<String> resolvedPaths,
+                      String op,
+                      String expectedRaw,
+                      Object expectedTyped,
+                      boolean matchAnywhere) {
+        this.originalKey = Objects.requireNonNull(originalKey, "originalKey");
+        this.resolvedPaths = Collections.unmodifiableList(new ArrayList<>(resolvedPaths));
+        this.op = (op == null || op.isBlank()) ? "eq" : op;
+        this.expectedRaw = expectedRaw;
+        this.expectedTyped = expectedTyped;
+        this.matchAnywhere = matchAnywhere;
+        if (this.resolvedPaths.isEmpty()) {
+            throw new IllegalArgumentException("resolvedPaths cannot be empty for key=" + originalKey);
+        }
+    }
+}
