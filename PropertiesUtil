@@ -1,0 +1,143 @@
+package com.fiserv.fef.utils;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.slf4j.helpers.MessageFormatter;
+
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.util.Locale;
+import java.util.Properties;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+public final class PropertiesUtil {
+    private static final Logger LOGGER = LoggerFactory.getLogger(PropertiesUtil.class);
+
+    private final Pattern envVarWithDefaultValuePattern = Pattern.compile("\\$\\{([a-zA-Z0-9_]+)[:-]*([^}]*)}");
+
+    private static volatile PropertiesUtil configuration = null;
+
+    private final Properties properties;
+
+    private PropertiesUtil() {
+        this.properties = this.loadProperties(getPropertiesFilePath());
+    }
+
+
+    public static PropertiesUtil getInstance() {
+        if (configuration == null) {
+            synchronized (PropertiesUtil.class) {
+                if (configuration == null) {
+                    configuration = new PropertiesUtil();
+                }
+            }
+        }
+        return configuration;
+    }
+
+    private Properties loadProperties(String filepath) throws RuntimeException {
+        Properties properties = new Properties();
+        File propertyFile = new File(filepath);
+
+        try (InputStream inputStream = propertyFile.exists() ? new FileInputStream(propertyFile) : this.getClass().getClassLoader().getResourceAsStream(filepath)) {
+            if (inputStream == null) { // if properties are still null
+                String message = formatter("Resource '{}' is not found in fat jar or classpath.", filepath);
+                LOGGER.error(message);
+                throw new RuntimeException(message);
+            }
+
+            properties.load(inputStream);
+
+            for (String key : properties.stringPropertyNames()) {
+                // After the property override is processed, apply any variables in the value
+                properties.setProperty(key, replaceVariable(getDeploymentValue(key, properties.get(key).toString())));
+            }
+        } catch (IOException ioe) {
+            String message = formatter("Error reading the properties file from '{}'.", filepath);
+            LOGGER.error(message, ioe);
+            throw new RuntimeException(message, ioe);
+        } catch (Exception e) {
+            String message = formatter("Error loading properties from resource '{}'.", filepath);
+            LOGGER.error(message, e);
+            throw new RuntimeException(message, e);
+        }
+        return properties;
+    }
+
+    private String formatter(String messageUsingBraces, Object... objects) {
+        return MessageFormatter.arrayFormat(messageUsingBraces, objects).getMessage();
+    }
+
+    private String getDeploymentValue(final String keyName, String defaultValue) {
+        if (LOGGER.isDebugEnabled()) {
+            LOGGER.debug("entering getDeploymentValue({}, {})", keyName, defaultValue);
+        }
+        if (null == keyName || keyName.isEmpty()) {
+            LOGGER.error("null keyName. getDeploymentValue(keyName is '{}')", keyName);
+            return null;
+        }
+        String canonicalVarName = keyName.toUpperCase(Locale.ROOT).replace('.', '_').replace('-', '_');
+        String value = System.getenv(canonicalVarName);
+        if (null != value) {
+            if (LOGGER.isDebugEnabled()) {
+                LOGGER.debug("Property '{}'  is overridden by environment variable '{}' = '{}'", keyName, canonicalVarName, value);
+            }
+        } else {
+            value = System.getProperty(canonicalVarName);
+            if (null != value) {
+                if (LOGGER.isDebugEnabled()) {
+                    LOGGER.debug("Property '{}'  is overridden by java system property '{}' = '{}'", keyName, canonicalVarName, value);
+                }
+            } else {
+                value = defaultValue;
+            }
+        }
+        if (null == value) {
+            LOGGER.error("property '{}' is null.", keyName);
+        }
+        if (LOGGER.isDebugEnabled()) {
+            LOGGER.debug("leaving getDeploymentValue({}, {})", keyName, value);
+        }
+        return value;
+    }
+
+    private String replaceVariable(String propertyValue) {
+        if (LOGGER.isDebugEnabled()) {
+            LOGGER.debug("entering replaceVariable({})", propertyValue);
+        }
+        Matcher matcher = envVarWithDefaultValuePattern.matcher(propertyValue);
+        if (matcher.find()) {
+            String envVarName = matcher.group(1);
+            String defaultValue = null;
+            if (matcher.groupCount() > 1) {
+                defaultValue = matcher.group(2);
+            }
+            if (null == defaultValue || defaultValue.isEmpty()) {
+                defaultValue = null;
+            }
+            String envVarValue = getDeploymentValue(envVarName, defaultValue);
+            if (null != envVarValue) {
+                return replaceVariable(matcher.replaceFirst(envVarValue));
+            }
+        }
+        if (LOGGER.isDebugEnabled()) {
+            LOGGER.debug("leaving replaceVariable({})", propertyValue);
+        }
+        return propertyValue;
+    }
+
+    private String getPropertiesFilePath() {
+        return "application.properties";
+    }
+
+    public String getProperty(String key) {
+        return this.properties.getProperty(key);
+    }
+
+    public String getProperty(String key, String defaultValue) {
+        return this.properties.getProperty(key, defaultValue);
+    }
+}
