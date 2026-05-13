@@ -1,0 +1,54 @@
+package com.fiserv.fef.parquet.validation;
+
+import com.fiserv.fef.parquet.filter.FilterCondition;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
+public final class ValidationContext {
+    private ParquetReadSpec source;
+    private ParquetReadSpec target;
+    private final List<FilterCondition> filters = new ArrayList<>();
+
+    public ParquetReadSpec getSource() {
+        return source;
+    }
+
+    public ParquetReadSpec getTarget() {
+        return target;
+    }
+
+    public List<FilterCondition> getFilters() {
+        return Collections.unmodifiableList(filters);
+    }
+
+    public void setSource(ParquetReadSpec s) {
+        this.source = s;
+    }
+
+    public void setTarget(ParquetReadSpec t) {
+        this.target = t;
+    }
+
+    /**
+     * Backward-compatible add (appends).
+     */
+    public void addFilters(List<FilterCondition> f) {
+        if (f == null || f.isEmpty()) return;
+        filters.addAll(f);
+    }
+
+    /**
+     * Preferred: replace existing filters.
+     */
+    public void setFilters(List<FilterCondition> f) {
+        filters.clear();
+        if (f == null || f.isEmpty()) return;
+        filters.addAll(f);
+    }
+
+    public void clearFilters() {
+        filters.clear();
+    }
+}
