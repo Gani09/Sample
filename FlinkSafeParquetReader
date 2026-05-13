@@ -1,0 +1,60 @@
+package com.fiserv.fef.parquet;
+
+import com.fiserv.fef.hadoop.HadoopClientManager;
+import com.fiserv.fef.parquet.util.StopScanException;
+import org.apache.parquet.schema.MessageType;
+
+import java.security.PrivilegedExceptionAction;
+import java.util.Map;
+import java.util.Objects;
+import java.util.function.Consumer;
+
+/**
+ * Flink/parallel-safe wrapper that forces Parquet reads to run under loginUgi.doAs().
+ */
+public final class FlinkSafeParquetReader {
+    private final HadoopClientManager.HadoopClientContext hCtx;
+    private final FefParquetReader reader;
+    private volatile MessageType lastReadSchema;
+
+    public FlinkSafeParquetReader(HadoopClientManager.HadoopClientContext hCtx) {
+        this.hCtx = Objects.requireNonNull(hCtx, "hCtx");
+        this.reader = new FefParquetReader(hCtx, schema -> this.lastReadSchema = schema);
+    }
+
+    public MessageType getLastReadSchema() {
+        return lastReadSchema;
+    }
+
+    /**
+     * Read up to maxMatches matched records.
+     * Uses StopScanException internally to terminate scan early.
+     */
+    public void readMatches(String inputFilters,
+                            String fieldNames,
+                            String fullFileName,
+                            int maxMatches,
+                            Consumer<Map<String, Object>> onRow) throws Exception {
+        final int limit = Math.max(1, maxMatches);
+        hCtx.doAs((PrivilegedExceptionAction<Void>) () -> {
+            final int[] seen = {0};
+            try {
+                reader.processFilteredRecords(
+                        inputFilters,
+                        fieldNames,
+                        fullFileName,
+                        row -> {
+                            onRow.accept(row);
+                            seen[0]++;
+                            if (seen[0] >= limit) {
+                                throw new StopScanException();
+                            }
+                        }
+                );
+            } catch (StopScanException stop) {
+                // normal early-stop
+            }
+            return null;
+        });
+    }
+}
