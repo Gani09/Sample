@@ -1,0 +1,14 @@
+package com.fiserv.fef.kafka;
+
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+
+public class KafkaMultiTopicToDataBaseTestMain {
+    public static void main(String[] args) throws Exception {
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        // Load KafkaConfig (reads from application.properties)
+        KafkaConfig kafkaConfig = new KafkaConfig();
+        // Create and run the job
+        KafkaMultiTopicToDataBase job = new KafkaMultiTopicToDataBase(env, kafkaConfig);
+        job.buildAndRun();
+    }
+}
