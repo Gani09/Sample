@@ -1,0 +1,32 @@
+package com.fiserv.fef.gherkin;
+
+import com.fiserv.fef.models.ValidationConfig;
+import com.fiserv.fef.models.ValidationResult;
+
+/**
+ * Interface for validation executors
+ * Different implementations for different validation types
+ */
+public interface ValidationExecutor {
+    
+    /**
+     * Execute validation
+     * @param config Validation configuration
+     * @param context Execution context
+     * @return Validation result
+     */
+    ValidationResult execute(ValidationConfig config, ValidationContext context);
+    
+    /**
+     * Check if this executor can handle the given validation
+     * @param config Validation configuration
+     * @return true if this executor supports the validation type
+     */
+    boolean canHandle(ValidationConfig config);
+    
+    /**
+     * Get executor type (for logging/debugging)
+     * @return Executor type (e.g., "gherkin", "mongodb_count")
+     */
+    String getExecutorType();
+}
