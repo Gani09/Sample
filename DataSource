@@ -1,0 +1,50 @@
+package com.fiserv.fef.datasources;
+
+import com.fiserv.fef.models.DataQuery;
+import com.fiserv.fef.models.Dataset;
+import org.bson.Document;
+import java.util.List;
+import java.util.Set;
+
+/**
+ * Interface for all data sources (MongoDB, Flink, Kafka, etc.)
+ * Provides unified data access regardless of underlying implementation
+ */
+public interface DataSource {
+    
+    /**
+     * Load data based on query
+     * @param query Query specification
+     * @return Dataset containing results
+     */
+    Dataset load(DataQuery query);
+    
+    /**
+     * Count documents matching query
+     * @param query Query specification
+     * @return Count of matching documents
+     */
+    long count(DataQuery query);
+    
+    /**
+     * Get distinct values for a field
+     * @param field Field name
+     * @param query Query specification
+     * @return Set of distinct values
+     */
+    Set<Object> distinct(String field, DataQuery query);
+    
+    /**
+     * Execute aggregation pipeline
+     * @param collection Collection name
+     * @param pipeline Aggregation pipeline
+     * @return Aggregation results
+     */
+    List<Document> aggregate(String collection, List<Document> pipeline);
+    
+    /**
+     * Get data source type (for logging/debugging)
+     * @return Source type (e.g., "mongodb_aggregation", "flink_dataset")
+     */
+    String getSourceType();
+}
