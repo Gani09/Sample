@@ -1,0 +1,35 @@
+package com.fiserv.fef.utils;
+
+import org.slf4j.Logger;
+
+import java.util.concurrent.TimeUnit;
+
+public final class Timing {
+
+    private Timing() {
+    }
+
+    /** Start a timer (returns start time in nanos). */
+    public static long start() {
+        return System.nanoTime();
+    }
+
+    /** Elapsed time in milliseconds since start(). */
+    public static long elapsedMs(long startNanos) {
+        return TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
+    }
+
+    /** INFO-level duration log (used in standalone runner). */
+    public static void log(Logger log, String label, long startNanos) {
+        if (log != null) {
+            log.info("[TIMING] {} took {} ms", label, elapsedMs(startNanos));
+        }
+    }
+
+    /** DEBUG-level duration log (safe for hot paths). */
+    public static void debug(Logger log, String label, long startNanos) {
+        if (log != null && log.isDebugEnabled()) {
+            log.debug("[TIMING] {} took {} ms", label, elapsedMs(startNanos));
+        }
+    }
+}
