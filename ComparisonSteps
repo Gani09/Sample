@@ -1,0 +1,193 @@
+package com.fiserv.fef.stepdefs;
+
+import com.fiserv.fef.gherkin.ValidationContext;
+import com.fiserv.fef.models.Dataset;
+import com.fiserv.fef.gherkin.annotations.When;
+import org.bson.Document;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.HashSet;
+import java.util.Set;
+
+/**
+ * Step definitions for comparing data between source and target collections
+ */
+public class ComparisonSteps {
+
+    private static final Logger LOG = LoggerFactory.getLogger(ComparisonSteps.class);
+
+
+    /**
+     * Compare a field list from source collection to target collection
+     * Example: When I compare "accountUuid" list from source collection to "accountUuid" list from target collection
+     *
+     * This step expects that both source and target data have been loaded previously using retrieve steps.
+     * It compares the distinct values and identifies matches and missing values.
+     */
+    @When("I compare {string} list from source collection to {string} list from target collection")
+    public void compareListFromSourceToTarget(String sourceField, String targetField) {
+        LOG.info("Comparing '{}' list from source to '{}' list in target", sourceField, targetField);
+
+        ValidationContext context = ValidationContext.getCurrent();
+
+        // Get source values
+        String sourceVariableName = "source_" + sourceField.replace(".", "_");
+        @SuppressWarnings("unchecked")
+        Set<String> sourceValues = (Set<String>) context.getVariable(sourceVariableName);
+
+        if (sourceValues == null || sourceValues.isEmpty()) {
+            throw new IllegalStateException("No source values found for field '" + sourceField + "'. " +
+                    "Expected variable: " + sourceVariableName + ". " +
+                    "Make sure to load source data first.");
+        }
+
+        // Get target values - try direct Set first (from optimized aggregation path), then try Dataset
+        String targetVariableName = "target_" + targetField.replace(".", "_");
+        @SuppressWarnings("unchecked")
+        Set<String> targetValues = (Set<String>) context.getVariable(targetVariableName);
+
+        // If not found as a Set, try to get from Dataset
+        if (targetValues == null) {
+            Dataset targetDataset = context.getDataset("target");
+            if (targetDataset == null) {
+                throw new IllegalStateException("No target values found for field '" + targetField + "'. " +
+                        "Expected variable: " + targetVariableName + " or target dataset. " +
+                        "Make sure to load target data first.");
+            }
+
+            // Extract target values from dataset
+            targetValues = new HashSet<>();
+            for (Document doc : targetDataset.getDocuments()) {
+                Object value = doc.get(targetField);
+                if (value != null) {
+                    targetValues.add(value.toString());
+                }
+            }
+        }
+
+        LOG.info("Comparing {} source values against {} target values",
+                sourceValues.size(), targetValues.size());
+
+        // Calculate matches and missing
+        Set<String> foundValues = new HashSet<>(sourceValues);
+        foundValues.retainAll(targetValues); // Keep only values that exist in target
+
+        Set<String> missingValues = new HashSet<>(sourceValues);
+        missingValues.removeAll(targetValues); // Remove all that exist in target
+
+        Set<String> extraInTarget = new HashSet<>(targetValues);
+        extraInTarget.removeAll(sourceValues); // Values in target but not in source
+
+        // Calculate match rate
+        double matchRate = sourceValues.isEmpty() ? 0.0 :
+                (double) foundValues.size() / sourceValues.size() * 100.0;
+
+        // Store comparison results in context
+        context.setVariable("comparison_source_field", sourceField);
+        context.setVariable("comparison_target_field", targetField);
+        context.setVariable("comparison_source_count", sourceValues.size());
+        context.setVariable("comparison_target_count", targetValues.size());
+        context.setVariable("comparison_found_count", foundValues.size());
+        context.setVariable("comparison_missing_count", missingValues.size());
+        context.setVariable("comparison_extra_in_target_count", extraInTarget.size());
+        context.setVariable("comparison_match_rate", matchRate);
+        context.setVariable("comparison_found_values", foundValues);
+        context.setVariable("comparison_missing_values", missingValues);
+        context.setVariable("comparison_extra_in_target", extraInTarget);
+
+        LOG.info("Comparison results: {} found, {} missing, {} extra in target (match rate: {}%)",
+                foundValues.size(), missingValues.size(), extraInTarget.size(),
+                String.format("%.2f", matchRate));
+
+        // Log sample missing values if any
+        if (!missingValues.isEmpty()) {
+            String sampleMissing = missingValues.stream()
+                    .limit(5)
+                    .reduce((a, b) -> a + ", " + b)
+                    .orElse("");
+            LOG.info("Sample missing {}: {}", sourceField, sampleMissing);
+        }
+
+        // Log sample extra values if any
+        if (!extraInTarget.isEmpty()) {
+            String sampleExtra = extraInTarget.stream()
+                    .limit(5)
+                    .reduce((a, b) -> a + ", " + b)
+                    .orElse("");
+            LOG.debug("Sample extra in target {}: {}", targetField, sampleExtra);
+        }
+    }
+
+    /**
+     * Compare record counts between source and target
+     * Example: When I compare "source" and "target" record counts
+     *
+     * This step expects that both source and target counts have been calculated previously.
+     * It stores comparison results in context for assertion steps.
+     */
+    @When("I compare {string} and {string} record counts")
+    public void compareRecordCounts(String sourceContext, String targetContext) {
+        LOG.info("Comparing record counts between '{}' and '{}'", sourceContext, targetContext);
+
+        ValidationContext context = ValidationContext.getCurrent();
+
+        // Get source count - try different possible variable names
+        Integer sourceCount = null;
+        String sourceCountVar = sourceContext + "_count";
+
+        // Try getting as Integer first, then Long
+        sourceCount = context.getVariable(sourceCountVar, Integer.class);
+        if (sourceCount == null) {
+            Long sourceCountLong = context.getVariable(sourceCountVar, Long.class);
+            if (sourceCountLong != null) {
+                sourceCount = sourceCountLong.intValue();
+            }
+        }
+
+        // Get target count
+        Integer targetCount = null;
+        String targetCountVar = targetContext + "_count";
+
+        targetCount = context.getVariable(targetCountVar, Integer.class);
+        if (targetCount == null) {
+            Long targetCountLong = context.getVariable(targetCountVar, Long.class);
+            if (targetCountLong != null) {
+                targetCount = targetCountLong.intValue();
+            }
+        }
+
+        if (sourceCount == null) {
+            throw new IllegalStateException("No " + sourceContext + " count found. " +
+                    "Expected variable: " + sourceCountVar + ". " +
+                    "Make sure to load " + sourceContext + " data first.");
+        }
+
+        if (targetCount == null) {
+            throw new IllegalStateException("No " + targetContext + " count found. " +
+                    "Expected variable: " + targetCountVar + ". " +
+                    "Make sure to load " + targetContext + " data first.");
+        }
+
+        LOG.info("Comparing counts: {}={}, {}={}",
+                sourceContext, sourceCount, targetContext, targetCount);
+
+        // Calculate difference and ratio
+        int difference = targetCount - sourceCount;
+        double ratio = sourceCount == 0 ? 0.0 : (double) targetCount / sourceCount;
+
+        // Store comparison results
+        context.setVariable("count_comparison_source_context", sourceContext);
+        context.setVariable("count_comparison_target_context", targetContext);
+        context.setVariable("count_comparison_source_count", sourceCount);
+        context.setVariable("count_comparison_target_count", targetCount);
+        context.setVariable("count_comparison_difference", difference);
+        context.setVariable("count_comparison_ratio", ratio);
+        context.setVariable("count_comparison_match", sourceCount.equals(targetCount));
+
+        LOG.info("Count comparison results: source={}, target={}, difference={}, ratio={}x, match={}",
+                sourceCount, targetCount, difference, String.format("%.2f", ratio), sourceCount.equals(targetCount));
+    }
+}
+
+
