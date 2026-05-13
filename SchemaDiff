@@ -1,0 +1,81 @@
+package com.fiserv.fef.parquet.schema;
+
+import org.apache.parquet.schema.MessageType;
+import org.apache.parquet.schema.Type;
+
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+public final class SchemaDiff {
+
+    private final List<String> diffs;
+
+    private SchemaDiff(List<String> diffs) {
+        this.diffs = diffs;
+    }
+
+    public boolean isCompatible() {
+        return diffs.isEmpty();
+    }
+
+    public String prettyPrint() {
+        StringBuilder sb = new StringBuilder();
+        String ls = System.lineSeparator();
+        for (String s : diffs) {
+            sb.append("- ").append(s).append(ls);
+        }
+        return sb.toString();
+    }
+
+    public static SchemaDiff compare(MessageType source, MessageType target) {
+        Map<String, Type> src = flatten(source);
+        Map<String, Type> tgt = flatten(target);
+        List<String> diffs = new ArrayList<>();
+
+        for (String path : src.keySet()) {
+            if (!tgt.containsKey(path)) {
+                diffs.add("Missing field in target: " + path);
+            } else if (!equalsType(src.get(path), tgt.get(path))) {
+                diffs.add("Type mismatch at " + path);
+            }
+        }
+
+        for (String path : tgt.keySet()) {
+            if (!src.containsKey(path)) {
+                diffs.add("Extra field in target: " + path);
+            }
+        }
+
+        return new SchemaDiff(diffs);
+    }
+
+    private static boolean equalsType(Type a, Type b) {
+        if (a.isPrimitive() != b.isPrimitive()) {
+            return false;
+        }
+        if (a.isPrimitive()) {
+            return a.asPrimitiveType().getPrimitiveTypeName() == b.asPrimitiveType().getPrimitiveTypeName()
+                    && a.getRepetition() == b.getRepetition();
+        }
+        return true;
+    }
+
+    private static Map<String, Type> flatten(MessageType schema) {
+        Map<String, Type> map = new LinkedHashMap<>();
+        walk(schema, "", map);
+        return map;
+    }
+
+    private static void walk(Type type, String path, Map<String, Type> out) {
+        if (type.isPrimitive()) {
+            out.put(path, type);
+            return;
+        }
+        for (Type child : type.asGroupType().getFields()) {
+            String childPath = path.isEmpty() ? child.getName() : path + "." + child.getName();
+            walk(child, childPath, out);
+        }
+    }
+}
