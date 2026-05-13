@@ -1,0 +1,62 @@
+package com.fiserv.fef.utils;
+
+import java.io.Serializable;
+
+/**
+ * MongoDB configuration holder
+ * Can be loaded from properties file or environment variables
+ */
+public class MongoDBConfig implements Serializable {
+
+    private String uri;
+    private String database;
+    private int maxPoolSize;
+    private int minPoolSize;
+    private int connectTimeoutMs;
+    private int readTimeoutMs;
+
+    public MongoDBConfig() {
+        // Default values
+        this.uri = "mongodb://localhost:27017";
+        this.database = "fef";
+        this.maxPoolSize = 50;
+        this.minPoolSize = 5;
+        this.connectTimeoutMs = 10000;
+        this.readTimeoutMs = 30000;
+    }
+
+    public static MongoDBConfig fromEnvironment() {
+        MongoDBConfig config = new MongoDBConfig();
+
+        String envUri = System.getenv("MONGODB_URI");
+        if (envUri != null && !envUri.isEmpty()) {
+            config.setUri(envUri);
+        }
+
+        String envDb = System.getenv("MONGODB_DATABASE");
+        if (envDb != null && !envDb.isEmpty()) {
+            config.setDatabase(envDb);
+        }
+
+        return config;
+    }
+
+    // Getters and Setters
+    public String getUri() { return uri; }
+    public void setUri(String uri) { this.uri = uri; }
+
+    public String getDatabase() { return database; }
+    public void setDatabase(String database) { this.database = database; }
+
+    public int getMaxPoolSize() { return maxPoolSize; }
+    public void setMaxPoolSize(int maxPoolSize) { this.maxPoolSize = maxPoolSize; }
+
+    public int getMinPoolSize() { return minPoolSize; }
+    public void setMinPoolSize(int minPoolSize) { this.minPoolSize = minPoolSize; }
+
+    public int getConnectTimeoutMs() { return connectTimeoutMs; }
+    public void setConnectTimeoutMs(int connectTimeoutMs) { this.connectTimeoutMs = connectTimeoutMs; }
+
+    public int getReadTimeoutMs() { return readTimeoutMs; }
+    public void setReadTimeoutMs(int readTimeoutMs) { this.readTimeoutMs = readTimeoutMs; }
+}
