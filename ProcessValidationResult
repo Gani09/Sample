@@ -1,0 +1,101 @@
+package com.fiserv.fef.models;
+
+import java.io.Serializable;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.List;
+
+/**
+ * Aggregated result for entire process validation
+ */
+public class ProcessValidationResult implements Serializable {
+    
+    private String pipelineRunID;  // MongoDB _id of the trigger document
+    private String processID;
+    private String processName;
+    private int totalValidations;
+    private int passedValidations;
+    private int failedValidations;
+    private List<ValidationResult> validationResults;
+    private List<ScoreComponent> scoreComponents;
+    private Date startedAt;
+    private Date completedAt;
+    private long totalDurationMs;
+    
+    public ProcessValidationResult() {
+        this.validationResults = new ArrayList<>();
+        this.scoreComponents = new ArrayList<>();
+        this.startedAt = new Date();
+    }
+    
+    public ProcessValidationResult(String processID, String processName) {
+        this();
+        this.processID = processID;
+        this.processName = processName;
+    }
+    
+    public void addValidationResult(ValidationResult result) {
+        this.validationResults.add(result);
+        this.totalValidations++;
+        if (result.isPassed()) {
+            this.passedValidations++;
+        } else {
+            this.failedValidations++;
+        }
+    }
+    
+    public void markComplete() {
+        this.completedAt = new Date();
+        this.totalDurationMs = completedAt.getTime() - startedAt.getTime();
+    }
+    
+    public boolean allPassed() {
+        return failedValidations == 0 && totalValidations > 0;
+    }
+    
+    // Getters and Setters
+    public String getPipelineRunID() { return pipelineRunID; }
+    public void setPipelineRunID(String pipelineRunID) { this.pipelineRunID = pipelineRunID; }
+
+    public String getProcessID() { return processID; }
+    public void setProcessID(String processID) { this.processID = processID; }
+
+    public String getProcessName() { return processName; }
+    public void setProcessName(String processName) { this.processName = processName; }
+    
+    public int getTotalValidations() { return totalValidations; }
+    public void setTotalValidations(int totalValidations) { this.totalValidations = totalValidations; }
+    
+    public int getPassedValidations() { return passedValidations; }
+    public void setPassedValidations(int passedValidations) { this.passedValidations = passedValidations; }
+    
+    public int getFailedValidations() { return failedValidations; }
+    public void setFailedValidations(int failedValidations) { this.failedValidations = failedValidations; }
+    
+    public List<ValidationResult> getValidationResults() { return validationResults; }
+    public void setValidationResults(List<ValidationResult> validationResults) { this.validationResults = validationResults; }
+    
+    public List<ScoreComponent> getScoreComponents() { return scoreComponents; }
+    public void setScoreComponents(List<ScoreComponent> scoreComponents) { this.scoreComponents = scoreComponents; }
+
+    public Date getStartedAt() { return startedAt; }
+    public void setStartedAt(Date startedAt) { this.startedAt = startedAt; }
+    
+    public Date getCompletedAt() { return completedAt; }
+    public void setCompletedAt(Date completedAt) { this.completedAt = completedAt; }
+    
+    public long getTotalDurationMs() { return totalDurationMs; }
+    public void setTotalDurationMs(long totalDurationMs) { this.totalDurationMs = totalDurationMs; }
+    
+    @Override
+    public String toString() {
+        return "ProcessValidationResult{" +
+                "processID='" + processID + '\'' +
+                ", total=" + totalValidations +
+                ", passed=" + passedValidations +
+                ", failed=" + failedValidations +
+                ", duration=" + totalDurationMs + "ms" +
+                ", scores=" + scoreComponents +
+                '}';
+    }
+}
