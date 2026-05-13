@@ -1,0 +1,43 @@
+package com.fiserv.fef.parquet.distributed;
+
+import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.flink.streaming.api.datastream.DataStream;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * Row-group-aware parallel Parquet reader.
+ *
+ * Uses ParallelParquetRowGroupSource which assigns Parquet row groups to subtasks
+ * via modulo distribution — guaranteeing even load across all parallel instances.
+ *
+ * Fixes the "19 completed, 1 still running" skew caused by FileSource byte-range
+ * splits not aligning with Parquet row group boundaries.
+ *
+ * Supports ALL Parquet physical types including DOUBLE via the Group API.
+ */
+public class ParallelParquetFileSource {
+
+    private static final Logger LOG = LoggerFactory.getLogger(ParallelParquetFileSource.class);
+
+    /**
+     * Create a parallel DataStream from Parquet file using row-group-level distribution.
+     */
+    public static DataStream<DistributedParquetCompareJob.TaggedRecord> readParquet(
+            StreamExecutionEnvironment env,
+            String filePath,
+            String joinKey,
+            String side,
+            int parallelism) {
+
+        LOG.info("🚀 [{}] Creating row-group-parallel source for {} with parallelism={}",
+                side, filePath, parallelism);
+
+        return env
+                .addSource(new ParallelParquetRowGroupSource(filePath, joinKey, side))
+                .setParallelism(parallelism)
+                .name(side + "-Parquet-Parallel")
+                .returns(TypeInformation.of(DistributedParquetCompareJob.TaggedRecord.class));
+    }
+}
