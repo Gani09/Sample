@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+         http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.fiserv.fef</groupId>
+        <artifactId>fef-flink-engine-jobs</artifactId>
+        <version>1.0.0</version>
+    </parent>
+
+    <artifactId>fef-main-job</artifactId>
+    <packaging>jar</packaging>
+
+    <name>FEF Main Job</name>
+    <description>Main orchestrator job (always running)</description>
+
+    <dependencies>
+        <!-- Common Module -->
+        <dependency>
+            <groupId>com.fiserv.fef</groupId>
+            <artifactId>fef-validation-common</artifactId>
+            <version>1.0.0</version>
+        </dependency>
+        <!-- Flink Clients -->
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-clients</artifactId>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>3.5.0</version>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                        <configuration>
+                            <artifactSet>
+                                <excludes>
+                                    <!-- Exclude core Flink (provided by runtime) but KEEP connectors -->
+                                    <exclude>org.apache.flink:flink-streaming-java</exclude>
+                                    <exclude>org.apache.flink:flink-java</exclude>
+                                    <exclude>org.apache.flink:flink-clients</exclude>
+                                    <exclude>org.apache.flink:flink-core</exclude>
+                                    <exclude>org.apache.flink:flink-runtime</exclude>
+                                    <exclude>org.apache.flink:flink-optimizer</exclude>
+                                    <exclude>org.apache.flink:flink-metrics-core</exclude>
+                                    <exclude>org.apache.flink:flink-annotations</exclude>
+                                    <exclude>org.apache.flink:flink-queryable-state-client-java</exclude>
+                                    <exclude>org.apache.flink:flink-hadoop-fs</exclude>
+                                    <exclude>org.apache.flink:flink-shaded-*</exclude>
+                                    <exclude>org.apache.flink:flink-file-sink-common</exclude>
+                                    <!-- Keep flink-connector-files, flink-parquet, flink-avro in the JAR -->
+                                    <!-- Exclude MongoDB driver - it's in flink/lib via fef-validation-common -->
+                                    <exclude>org.mongodb:*</exclude>
+                                    <!-- Exclude SLF4J - provided by Flink runtime -->
+                                    <exclude>org.slf4j:*</exclude>
+                                </excludes>
+                            </artifactSet>
+                            <filters>
+                                <filter>
+                                    <artifact>*:*</artifact>
+                                    <excludes>
+                                        <exclude>META-INF/*.SF</exclude>
+                                        <exclude>META-INF/*.DSA</exclude>
+                                        <exclude>META-INF/*.RSA</exclude>
+                                        <!-- Strip SLF4J classes that sneak in via transitive deps -->
+                                        <exclude>org/slf4j/**</exclude>
+                                    </excludes>
+                                </filter>
+                            </filters>
+                            <transformers>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                                    <mainClass>com.fiserv.fef.jobs.MainValidationJob</mainClass>
+                                </transformer>
+                            </transformers>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>
+
