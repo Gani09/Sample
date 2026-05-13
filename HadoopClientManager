@@ -1,0 +1,143 @@
+package com.fiserv.fef.hadoop;
+
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.security.UserGroupInformation;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.Closeable;
+import java.net.URI;
+import java.security.PrivilegedExceptionAction;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public final class HadoopClientManager {
+
+    private static final Logger LOG = LoggerFactory.getLogger(HadoopClientManager.class);
+
+    private static volatile HadoopClientContext CACHED;
+    private static final Object LOCK = new Object();
+    private static final AtomicInteger REF = new AtomicInteger(0);
+
+    private HadoopClientManager() {
+    }
+
+    public static HadoopClientContext acquire(String fsDefault) throws Exception {
+        REF.incrementAndGet();
+        if (CACHED != null) return CACHED;
+
+        synchronized (LOCK) {
+            if (CACHED == null) {
+                Configuration conf = HadoopConfig.create(fsDefault);
+                UserGroupInformation loginUgi = UserGroupInformation.getLoginUser();
+
+                CACHED = new HadoopClientContext(conf, loginUgi);
+                LOG.info("HadoopClientContext cached. fs.defaultFS={}, loginUser={}",
+                        conf.get("fs.defaultFS"), loginUgi.getUserName());
+            }
+            return CACHED;
+        }
+    }
+
+    public static void release() {
+        int left = REF.decrementAndGet();
+        if (left <= 0) {
+            if (CACHED != null) {
+                CACHED.closeQuietly();
+                CACHED = null;
+            }
+        }
+    }
+
+    public static final class HadoopClientContext implements Closeable {
+        private final Configuration conf;
+        private final UserGroupInformation loginUgi;
+
+        private final ConcurrentHashMap<String, FileSystem> fsCache = new ConcurrentHashMap<>();
+
+        private final ExecutorService kerberosExecutor;
+
+        HadoopClientContext(Configuration conf, UserGroupInformation loginUgi) {
+            this.conf = conf;
+            this.loginUgi = loginUgi;
+            this.kerberosExecutor = Executors.newFixedThreadPool(
+                    Math.max(2, Runtime.getRuntime().availableProcessors() / 2),
+                    r -> {
+                        Thread t = new Thread(r);
+                        t.setName("krb-step-" + t.getId());
+                        t.setDaemon(true);
+                        return t;
+                    }
+            );
+        }
+
+        public Configuration conf() {
+            return conf;
+        }
+
+        public <T> T doAs(PrivilegedExceptionAction<T> action) throws Exception {
+            return loginUgi.doAs(action);
+        }
+
+        public <T> Future<T> submitDoAs(Callable<T> c) {
+            return kerberosExecutor.submit(() -> {
+                try {
+                    return doAs((PrivilegedExceptionAction<T>) c::call);
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+        }
+
+        public Future<?> submitDoAs(Runnable r) {
+            return kerberosExecutor.submit(() -> {
+                try {
+                    doAs((PrivilegedExceptionAction<Void>) () -> {
+                        r.run();
+                        return null;
+                    });
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+        }
+
+        public FileSystem fsFor(Path path) throws Exception {
+            URI uri = path.toUri();
+            URI defaultUri = URI.create(conf.get("fs.defaultFS", "file:///"));
+
+            String scheme = (uri.getScheme() == null) ? defaultUri.getScheme() : uri.getScheme();
+            String authority = (uri.getAuthority() == null) ? "" : uri.getAuthority();
+            String key = scheme + "://" + authority;
+
+            return fsCache.computeIfAbsent(key, k -> {
+                try {
+                    return doAs(() -> {
+                        URI target = authority.isEmpty() ? defaultUri : URI.create(k);
+                        return FileSystem.newInstance(target, conf);
+                    });
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+        }
+
+        @Override
+        public void close() {
+            HadoopClientManager.release();
+        }
+
+        void closeQuietly() {
+            kerberosExecutor.shutdown();
+            fsCache.values().forEach(fs -> {
+                try {
+                    fs.close();
+                } catch (Exception ignore) {
+                }
+            });
+            fsCache.clear();
+        }
+    }
+}
