@@ -1,0 +1,22 @@
+package com.fiserv.fef.parquet.validation;
+
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
+
+public final class RowData {
+
+    private final Map<String, Object> values;
+
+    public RowData(Map<String, Object> v) {
+        this.values = Collections.unmodifiableMap(new HashMap<>(v));
+    }
+
+    public Object get(String f) {
+        return values.get(f);
+    }
+
+    public Map<String, Object> getAll() {
+        return values;
+    }
+}
