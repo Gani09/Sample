@@ -1,0 +1,33 @@
+package com.fiserv.fef.gherkin;
+
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * Parsed Gherkin scenario representation
+ */
+public class ParsedScenario {
+
+    private String name;
+    private List<ParsedStep> steps;
+
+    public ParsedScenario() {
+        this.steps = new ArrayList<>();
+    }
+
+    public ParsedScenario(String name) {
+        this();
+        this.name = name;
+    }
+
+    public void addStep(ParsedStep step) {
+        this.steps.add(step);
+    }
+
+    // Getters and Setters
+    public String getName() { return name; }
+    public void setName(String name) { this.name = name; }
+
+    public List<ParsedStep> getSteps() { return steps; }
+    public void setSteps(List<ParsedStep> steps) { this.steps = steps; }
+}
