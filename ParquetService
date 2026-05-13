@@ -1,0 +1,676 @@
+package com.fiserv.fef.parquet.service;
+
+import com.fiserv.fef.hadoop.HadoopClientManager;
+import com.fiserv.fef.parquet.FlinkSafeParquetReader;
+import com.fiserv.fef.parquet.filter.FilterCondition;
+import com.fiserv.fef.parquet.filter.Operator;
+import com.fiserv.fef.parquet.schema.SchemaDiff;
+import com.fiserv.fef.parquet.validation.*;
+import com.fiserv.fef.utils.PropertiesUtil;
+import com.fiserv.fef.utils.Timing;
+import org.apache.parquet.schema.MessageType;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.Closeable;
+import java.lang.reflect.UndeclaredThrowableException;
+import java.security.PrivilegedActionException;
+import java.time.OffsetDateTime;
+import java.util.*;
+import java.util.function.Consumer;
+import java.util.stream.Collectors;
+
+public class ParquetService implements Closeable {
+    private static final Logger LOG = LoggerFactory.getLogger(ParquetService.class);
+    private static final String JOIN_SEP = "\n";
+    private static final String VALIDATION_TYPE_UPDATED_VALUE = "UpdatedValue";
+
+    private final HadoopClientManager.HadoopClientContext hCtx;
+    private final FlinkSafeParquetReader reader;
+    private volatile boolean closed;
+    private final ValidationFailureWriter failureWriter;
+    private final SchemaBasedValueComparator valueComparator = new SchemaBasedValueComparator();
+
+    public ParquetService() {
+        try {
+            String fsDefault = PropertiesUtil.getInstance().getProperty("fs.defaultFS", "file:///");
+            this.failureWriter = ValidationFailureWriterFactory.create();
+            this.hCtx = HadoopClientManager.acquire(fsDefault);
+            this.reader = new FlinkSafeParquetReader(hCtx);
+        } catch (Exception e) {
+            throw new ParquetServiceException("Failed to initialize ParquetService", e);
+        }
+    }
+
+    public void validateUpdatedValues(
+            ParquetReadSpec src,
+            ParquetReadSpec tgt,
+            List<FilterCondition> filters,
+            Map<String, Boolean> expected) {
+        LOG.info("Starting validateUpdatedValues with src={}, tgt={}, filters={}, expected={}", src.getPath(), tgt.getPath(), filters, expected);
+        validateUpdatedValuesInternal(src, tgt, filters, expected, null);
+        LOG.info("Completed validateUpdatedValues for src={}, tgt={}", src.getPath(), tgt.getPath());
+    }
+
+    public void validateUpdatedValues(
+            ParquetReadSpec src,
+            ParquetReadSpec tgt,
+            List<FilterCondition> filters,
+            Map<String, Boolean> expected,
+            MatchDebugListener debugListener) {
+        LOG.info("Starting validateUpdatedValues (with debugListener) with src={}, tgt={}, filters={}, expected={}", src.getPath(), tgt.getPath(), filters, expected);
+        validateUpdatedValuesInternal(src, tgt, filters, expected, debugListener);
+        LOG.info("Completed validateUpdatedValues (with debugListener) for src={}, tgt={}", src.getPath(), tgt.getPath());
+    }
+
+    // ---------------- CORE LOGIC ----------------
+    public void validateUpdatedValuesInternal(
+            ParquetReadSpec src,
+            ParquetReadSpec tgt,
+            List<FilterCondition> filters,
+            Map<String, Boolean> expected,
+            MatchDebugListener debugListener) {
+
+        LOG.info("Entered validateUpdatedValuesInternal for src={}, tgt={}", src.getPath(), tgt.getPath());
+        Objects.requireNonNull(src, "src");
+        Objects.requireNonNull(tgt, "tgt");
+        filters = (filters == null) ? List.of() : filters;
+
+        final long tTotal = Timing.start();
+        try {
+            MessageType srcSchema = readSchema(src.getPath());
+            MessageType tgtSchema = readSchema(tgt.getPath());
+            LOG.info("Read schemas for src={}, tgt={}", src.getPath(), tgt.getPath());
+
+            SchemaDiff diff = SchemaDiff.compare(srcSchema, tgtSchema);
+            if (!diff.isCompatible()) {
+                LOG.info("Schema mismatch detected between src and tgt");
+                throw new AssertionError("Schema mismatch: " + diff.prettyPrint());
+            }
+
+            List<String> joinKeys = filters.stream()
+                    .map(FilterCondition::getKey)
+                    .filter(Objects::nonNull)
+                    .map(String::trim)
+                    .filter(s -> !s.isEmpty())
+                    .distinct()
+                    .toList();
+
+            String inputFilters = filters.stream()
+                    .filter(f -> f.getValue().isPresent())
+                    .map(f -> {
+                        if (f.getOperator() != Operator.EQ) {
+                            throw new UnsupportedOperationException("Only EQ operator supported");
+                        }
+                        return f.getKey() + "=" + f.getValue().get();
+                    })
+                    .collect(Collectors.joining(","));
+
+            Map<String, String> explicitValues = extractExplicitValues(filters);
+            boolean fieldsDriven = expected != null && !expected.isEmpty();
+
+            String projection = fieldsDriven
+                    ? buildFieldsForFieldsDriven(src.getSelectedFields(), joinKeys, expected)
+                    : buildFieldsDefault(src.getSelectedFields(), joinKeys);
+
+            boolean earlyStopEligible =
+                    fieldsDriven && !joinKeys.isEmpty() && explicitValues.keySet().containsAll(joinKeys);
+
+            // -------- FAST PATH --------
+            if (earlyStopEligible) {
+                LOG.info("Early stop eligible: using fast path for src={}, tgt={}", src.getPath(), tgt.getPath());
+                List<RowData> srcRows = readUpToTwo(src.getPath(), inputFilters, projection);
+                List<RowData> tgtRows = readUpToTwo(tgt.getPath(), inputFilters, projection);
+
+                enforceSingleMatch("source", joinKeys, explicitValues, srcRows);
+                enforceSingleMatch("target", joinKeys, explicitValues, tgtRows);
+
+                RowData srcRow = srcRows.get(0);
+                RowData tgtRow = tgtRows.get(0);
+                String joinKey = buildJoinKeyFromExplicit(joinKeys, explicitValues);
+
+                if (debugListener != null) {
+                    debugListener.onMatch(joinKey, srcRow.getAll(), tgtRow.getAll());
+                }
+
+                List<ValidationFailure.FieldFailure> recordFailures = new ArrayList<>();
+                Set<String> fields = new LinkedHashSet<>();
+                fields.addAll(srcRow.getAll().keySet());
+                fields.addAll(tgtRow.getAll().keySet());
+
+                for (String field : fields) {
+                    Object s = srcRow.get(field);
+                    Object t = tgtRow.get(field);
+                    boolean equal = valueComparator.isEqual(s, t);
+                    Boolean expectedUpdated = expected.get(field);
+
+                    ValueValidationEvaluator
+                            .evaluate(expectedUpdated, equal, joinKey, field, s, t)
+                            .map(ValidationFailure::getFieldFailures)
+                            .ifPresent(recordFailures::addAll);
+                }
+
+                if (!recordFailures.isEmpty()) {
+                    LOG.info("Validation failures detected in fast path for joinKey={}", joinKey);
+                    ValidationFailure vf = ValidationFailure.of(recordFailures);
+                    vf.setJoinKeys(buildJoinKeyMap(tgtRow, joinKeys, srcRow));
+
+                    // FAST-PATH is exactly one logical record comparison
+                    writeAndThrowFailures(
+                            List.of(vf),
+                            VALIDATION_TYPE_UPDATED_VALUE,
+                            src.getPath(),
+                            tgt.getPath(),
+                            joinKeys,
+                            1L,   // total
+                            0L,   // passed
+                            1L    // failed
+                    );
+                }
+                LOG.info("Fast path validation passed for joinKey={}", joinKey);
+                return;
+            }
+
+            if (joinKeys.isEmpty()) {
+                LOG.info("No join keys detected, using subset comparison mode");
+                compareSubsetNoJoinKeys(src, tgt, inputFilters, projection, expected);
+            } else {
+                LOG.info("Join keys detected: {}. Using join target driven comparison mode", joinKeys);
+                compareJoinTargetDriven(src, tgt, inputFilters, projection, joinKeys, expected);
+            }
+        } finally {
+            Timing.log(LOG, "ParquetService.validateUpdatedValues(total)", tTotal);
+            LOG.info("Exiting validateUpdatedValuesInternal for src={}, tgt={}", src.getPath(), tgt.getPath());
+        }
+    }
+
+    // ---------------- JOIN MODE ----------------
+    private void compareJoinTargetDriven(
+            ParquetReadSpec src,
+            ParquetReadSpec tgt,
+            String inputFilters,
+            String projection,
+            List<String> joinKeys,
+            Map<String, Boolean> expected) {
+        LOG.info("Starting compareJoinTargetDriven with src={}, tgt={}, joinKeys={}", src.getPath(), tgt.getPath(), joinKeys);
+        Map<String, List<RowData>> srcIndex = new LinkedHashMap<>();
+        safeReadMatches(inputFilters, projection, src.getPath(), Integer.MAX_VALUE, r -> {
+            RowData rd = new RowData(r);
+            srcIndex.computeIfAbsent(buildJoinKey(rd, joinKeys), k -> new ArrayList<>()).add(rd);
+        });
+
+        List<ValidationFailure> failures = new ArrayList<>();
+        boolean useUpdated = expected != null && !expected.isEmpty();
+
+        final long[] total = {0L};
+        final long[] passed = {0L};
+        final long[] failed = {0L};
+
+        safeReadMatches(inputFilters, projection, tgt.getPath(), Integer.MAX_VALUE, r -> {
+            RowData tgtRow = new RowData(r);
+            String key = buildJoinKey(tgtRow, joinKeys);
+
+            List<RowData> srcRows = srcIndex.get(key);
+            if (srcRows == null || srcRows.isEmpty()) {
+                LOG.info("No matching record in source for join key: {}", key);
+                throw new AssertionError("No matching record in source for key: " + key);
+            }
+
+            RowData srcRow = srcRows.remove(0);
+            List<ValidationFailure.FieldFailure> recordFailures = new ArrayList<>();
+
+            Set<String> fields = new LinkedHashSet<>();
+            fields.addAll(srcRow.getAll().keySet());
+            fields.addAll(tgtRow.getAll().keySet());
+
+            for (String field : fields) {
+                Object s = srcRow.get(field);
+                Object t = tgtRow.get(field);
+                boolean equal = valueComparator.isEqual(s, t);
+                Boolean expectedUpdated = useUpdated ? expected.get(field) : null;
+
+                ValueValidationEvaluator
+                        .evaluate(expectedUpdated, equal, key, field, s, t)
+                        .map(ValidationFailure::getFieldFailures)
+                        .ifPresent(recordFailures::addAll);
+            }
+
+            total[0]++;
+
+            if (!recordFailures.isEmpty()) {
+                LOG.info("Validation failures detected for join key: {}", key);
+                ValidationFailure vf = ValidationFailure.of(recordFailures);
+                // Enhanced join key extraction (fallback to source if missing)
+                vf.setJoinKeys(buildJoinKeyMap(tgtRow, joinKeys, srcRow));
+                failures.add(vf);
+                failed[0]++;
+            } else {
+                passed[0]++;
+            }
+        });
+
+        if (!failures.isEmpty()) {
+            LOG.info("Writing and throwing failures for compareJoinTargetDriven, total failures: {}", failures.size());
+            writeAndThrowFailures(
+                    failures,
+                    VALIDATION_TYPE_UPDATED_VALUE,
+                    src.getPath(),
+                    tgt.getPath(),
+                    joinKeys,
+                    total[0],
+                    passed[0],
+                    failed[0]
+            );
+        }
+        LOG.info("Completed compareJoinTargetDriven for src={}, tgt={}", src.getPath(), tgt.getPath());
+    }
+
+    // ---------------- SUBSET MODE ----------------
+    private void compareSubsetNoJoinKeys(
+            ParquetReadSpec src,
+            ParquetReadSpec tgt,
+            String inputFilters,
+            String projection,
+            Map<String, Boolean> expected) {
+        LOG.info("Starting compareSubsetNoJoinKeys with src={}, tgt={}", src.getPath(), tgt.getPath());
+        List<RowData> srcRows = new ArrayList<>();
+        List<RowData> tgtRows = new ArrayList<>();
+
+        safeReadMatches(inputFilters, projection, src.getPath(), Integer.MAX_VALUE, r -> srcRows.add(new RowData(r)));
+        safeReadMatches(inputFilters, projection, tgt.getPath(), Integer.MAX_VALUE, r -> tgtRows.add(new RowData(r)));
+
+        int rows = Math.min(srcRows.size(), tgtRows.size());
+        if (rows == 0) {
+            LOG.info("No rows available to compare in subset mode");
+            throw new AssertionError("No rows available to compare (no join keys)");
+        }
+
+        Set<String> updatedFields = new HashSet<>();
+        if (expected != null) {
+            expected.entrySet().stream()
+                    .filter(e -> Boolean.TRUE.equals(e.getValue()))
+                    .map(Map.Entry::getKey)
+                    .forEach(updatedFields::add);
+        }
+
+        List<String> sortFields = computeSortFields(srcRows, tgtRows, updatedFields);
+        stableSortRows(srcRows, sortFields);
+        stableSortRows(tgtRows, sortFields);
+
+        List<ValidationFailure> failures = new ArrayList<>();
+        boolean useUpdated = expected != null && !expected.isEmpty();
+
+        long passed = 0L;
+        long failed = 0L;
+
+        for (int i = 0; i < rows; i++) {
+            RowData s = srcRows.get(i);
+            RowData t = tgtRows.get(i);
+            String key = "ROW#" + i;
+
+            List<ValidationFailure.FieldFailure> recordFailures = new ArrayList<>();
+            Set<String> fields = new LinkedHashSet<>();
+            fields.addAll(s.getAll().keySet());
+            fields.addAll(t.getAll().keySet());
+
+            for (String field : fields) {
+                Object sv = s.get(field);
+                Object tv = t.get(field);
+                boolean equal = valueComparator.isEqual(sv, tv);
+                Boolean expectedUpdated = useUpdated ? expected.get(field) : null;
+
+                ValueValidationEvaluator
+                        .evaluate(expectedUpdated, equal, key, field, sv, tv)
+                        .map(ValidationFailure::getFieldFailures)
+                        .ifPresent(recordFailures::addAll);
+            }
+
+            if (!recordFailures.isEmpty()) {
+                LOG.info("Validation failures detected for row index: {}", i);
+                ValidationFailure vf = ValidationFailure.of(recordFailures);
+                // Always set join key as ROW index for subset mode
+                vf.setJoinKeys(Map.of("ROW", String.valueOf(i)));
+                failures.add(vf);
+                failed++;
+            } else {
+                passed++;
+            }
+        }
+
+        if (!failures.isEmpty()) {
+            LOG.info("Writing and throwing failures for compareSubsetNoJoinKeys, total failures: {}", failures.size());
+            writeAndThrowFailures(
+                    failures,
+                    VALIDATION_TYPE_UPDATED_VALUE,
+                    src.getPath(),
+                    tgt.getPath(),
+                    List.of(),
+                    rows,
+                    passed,
+                    failed
+            );
+        }
+        LOG.info("Completed compareSubsetNoJoinKeys for src={}, tgt={}", src.getPath(), tgt.getPath());
+    }
+
+    // ---------------- HELPERS ----------------
+    private MessageType readSchema(String path) {
+        safeReadMatches("", "", path, 1, r -> {
+        });
+        MessageType schema = reader.getLastReadSchema();
+        if (schema == null) {
+            throw new IllegalStateException("Schema not available for " + path);
+        }
+        return schema;
+    }
+
+    private static List<String> computeSortFields(
+            List<RowData> srcRows,
+            List<RowData> tgtRows,
+            Set<String> excluded) {
+
+        if (srcRows == null || tgtRows == null || srcRows.isEmpty() || tgtRows.isEmpty()) {
+            return List.of();
+        }
+
+        Set<String> srcKeys = srcRows.get(0).getAll().keySet();
+        Set<String> tgtKeys = tgtRows.get(0).getAll().keySet();
+
+        List<String> out = new ArrayList<>();
+        for (String k : srcKeys) {
+            if (tgtKeys.contains(k) && (excluded == null || !excluded.contains(k))) {
+                out.add(k);
+            }
+        }
+        Collections.sort(out);
+        return out;
+    }
+
+    private static void stableSortRows(List<RowData> rows, List<String> sortFields) {
+        if (rows == null || rows.size() <= 1 || sortFields == null || sortFields.isEmpty()) {
+            return;
+        }
+
+        rows.sort((a, b) -> {
+            for (String f : sortFields) {
+                String as = String.valueOf(a.get(f));
+                String bs = String.valueOf(b.get(f));
+                int c = as.compareTo(bs);
+                if (c != 0) return c;
+            }
+            return 0;
+        });
+    }
+
+    private List<RowData> readUpToTwo(String path, String filters, String fields) {
+        List<RowData> out = new ArrayList<>(2);
+        safeReadMatches(filters, fields, path, 2, r -> out.add(new RowData(r)));
+        return out;
+    }
+
+    private void safeReadMatches(
+            String inputFilters,
+            String fields,
+            String path,
+            int maxMatches,
+            Consumer<Map<String, Object>> onRow) {
+        try {
+            reader.readMatches(inputFilters, fields, path, maxMatches, onRow);
+        } catch (Exception e) {
+            Throwable t = e;
+            while (t instanceof UndeclaredThrowableException || t instanceof PrivilegedActionException) {
+                t = t.getCause();
+            }
+            if (t instanceof AssertionError assertionError) throw assertionError;
+            if ("StopScanException".equals(t.getClass().getSimpleName())) return;
+            throw new ParquetServiceException("Parquet read failed: " + path, t);
+        }
+    }
+
+    private void enforceSingleMatch(String side, List<String> joinKeys, Map<String, String> values, List<RowData> rows) {
+        if (rows.isEmpty()) {
+            throw new AssertionError("No matching record in " + side + " for " + joinKeys + "=" + values);
+        }
+        if (rows.size() > 1) {
+            throw new AssertionError("Non-unique match in " + side + " for " + joinKeys + "=" + values);
+        }
+    }
+
+    private static Map<String, String> extractExplicitValues(List<FilterCondition> filters) {
+        Map<String, String> m = new LinkedHashMap<>();
+        for (FilterCondition f : filters) {
+            if (f.getOperator() == Operator.EQ && f.getValue() != null && f.getValue().isPresent()) {
+                m.put(f.getKey(), String.valueOf(f.getValue().get()));
+            }
+        }
+        return m;
+    }
+
+    private static String buildFieldsDefault(List<String> selected, List<String> joinKeys) {
+        // Always include join keys in projection, even if selected contains "*"
+        Set<String> f = new LinkedHashSet<>(joinKeys);
+        if (selected != null) {
+            selected.stream()
+                    .filter(s -> s != null && !s.isBlank())
+                    .forEach(s -> f.add(s.trim()));
+        }
+        // If selected contains "*", return "" (all fields), but log join keys
+        if (selected != null && selected.contains("*")) {
+            LOG.debug("Projection includes '*', joinKeys forced: {}", joinKeys);
+            return "";
+        }
+        return f.isEmpty() ? "" : String.join(",", f);
+    }
+
+    private static String buildFieldsForFieldsDriven(List<String> selected, List<String> joinKeys, Map<String, Boolean> expected) {
+        Set<String> f = new LinkedHashSet<>(joinKeys);
+        f.addAll(expected.keySet());
+        if (selected != null) {
+            selected.stream()
+                    .filter(s -> s != null && !s.isBlank() && !"*".equals(s))
+                    .forEach(s -> f.add(s.trim()));
+        }
+        // If selected contains "*", return "" (all fields), but log join keys
+        if (selected != null && selected.contains("*")) {
+            LOG.debug("Projection includes '*', joinKeys forced: {}", joinKeys);
+            return "";
+        }
+        return f.isEmpty() ? "" : String.join(",", f);
+    }
+
+    /**
+     * Robust key resolver for joinKeys (e.g., "chdAccountNumber"):
+     * - exact match: map.get(key)
+     * - case-insensitive exact match
+     * - suffix match for flattened dotted keys (e.g., "chdBaseSegment.chdAccountNumber")
+     * - true nested-map traversal for dotted keys if the map contains nested maps
+     */
+    private static Object resolveValue(Map<String, Object> map, String key) {
+        if (map == null || key == null) return null;
+
+        // (A) Exact match (works for flat maps including dotted keys)
+        if (map.containsKey(key)) return map.get(key);
+
+        // (B) Case-insensitive exact match
+        for (Map.Entry<String, Object> e : map.entrySet()) {
+            String k = e.getKey();
+            if (k != null && k.equalsIgnoreCase(key)) {
+                return e.getValue();
+            }
+        }
+
+        // (C) If requested key is simple (no dots) but actual is flattened dotted,
+        // try unique suffix match: "*.key"
+        if (!key.contains(".")) {
+            String suffix = "." + key;
+            String foundKey = null;
+            Object foundVal = null;
+
+            for (String k : map.keySet()) {
+                if (k != null && k.endsWith(suffix)) {
+                    if (foundKey != null) {
+                        // ambiguous: multiple candidates end with ".key"
+                        return null;
+                    }
+                    foundKey = k;
+                    foundVal = map.get(k);
+                }
+            }
+            if (foundKey != null) return foundVal;
+        }
+
+        // (D) Nested traversal for dotted keys (only if structure is nested maps)
+        if (key.contains(".")) {
+            Object current = map;
+            for (String part : key.split("\\.")) {
+                if (!(current instanceof Map<?, ?> m)) return null;
+                if (!m.containsKey(part)) return null;
+                current = m.get(part);
+                if (current == null) return null;
+            }
+            return current;
+        }
+
+        return null;
+    }
+
+    private static Map<String, String> buildJoinKeyMap(RowData targetRow, List<String> joinKeys, RowData sourceRow) {
+        Map<String, Object> tgtMap = targetRow.getAll();
+        Map<String, Object> srcMap = sourceRow != null ? sourceRow.getAll() : null;
+
+        Map<String, String> m = new LinkedHashMap<>();
+        for (String k : joinKeys) {
+            Object v = resolveValue(tgtMap, k);
+            if (v == null && srcMap != null) {
+                v = resolveValue(srcMap, k);
+            }
+
+            m.put(k, v == null ? "" : String.valueOf(v));
+
+            if (v == null) {
+                LOG.debug("JoinKey extraction FAILED: key='{}' not found in target/source. " +
+                                "tgtKeysSample={}, srcKeysSample={}",
+                        k,
+                        tgtMap != null ? tgtMap.keySet().stream().limit(50).toList() : null,
+                        srcMap != null ? srcMap.keySet().stream().limit(50).toList() : null
+                );
+            } else {
+                LOG.debug("JoinKey extraction: key='{}', value='{}'", k, v);
+            }
+        }
+        return m;
+    }
+
+    private static String buildJoinKey(RowData rd, List<String> joinKeys) {
+        Map<String, Object> map = rd.getAll();
+        return joinKeys.stream()
+                .map(k -> {
+                    Object v = resolveValue(map, k);
+                    return v == null ? "" : String.valueOf(v);
+                })
+                .collect(Collectors.joining(JOIN_SEP));
+    }
+
+    private static String buildJoinKeyFromExplicit(List<String> joinKeys, Map<String, String> values) {
+        return joinKeys.stream()
+                .map(k -> values.getOrDefault(k, ""))
+                .collect(Collectors.joining(JOIN_SEP));
+    }
+
+    private void writeAndThrowFailures(
+            List<ValidationFailure> failures,
+            String validationType,
+            String srcPath,
+            String tgtPath,
+            List<String> joinKeyNames,
+            long totalRecords,
+            long passedRecords,
+            long failedRecords) {
+
+        OffsetDateTime ts = OffsetDateTime.now();
+        for (ValidationFailure f : failures) {
+            enrichFailure(f, validationType, srcPath, tgtPath, ts, passedRecords, failedRecords);
+            failureWriter.write(f);
+        }
+
+        throw new AssertionError(buildAssertionPayload(
+                ts, joinKeyNames, totalRecords, passedRecords, failedRecords, srcPath, tgtPath, failures
+        ));
+    }
+
+    private String buildAssertionPayload(
+            OffsetDateTime ts,
+            List<String> joinKeyNames,
+            long totalRecords,
+            long passedRecords,
+            long failedRecords,
+            String srcPath,
+            String tgtPath,
+            List<ValidationFailure> failures) {
+
+        StringBuilder sb = new StringBuilder(512);
+        sb.append("Validation=FAILED\n");
+        sb.append("TimeStamp=").append(ts).append("\n");
+        sb.append("joinKeys={").append(joinKeyNames == null ? "" : String.join(",", joinKeyNames)).append("}\n");
+        sb.append("Total Records : ").append(totalRecords).append(" (Logical records)\n");
+        sb.append("Passed        : ").append(passedRecords).append("\n");
+        sb.append("Failed        : ").append(failedRecords).append("\n");
+        sb.append("srcPath=").append(srcPath).append("\n");
+        sb.append("tgtPath=").append(tgtPath).append("\n\n");
+
+        sb.append("Below details Only for Failed Rows (ignore passed all passed records)\n\n");
+        for (ValidationFailure f : failures) {
+            sb.append(ValidationFailureTextFormatter.format(f));
+        }
+        return sb.toString();
+    }
+
+    private void enrichFailure(
+            ValidationFailure f,
+            String validationType,
+            String srcPath,
+            String tgtPath,
+            OffsetDateTime ts,
+            long passedRecords,
+            long failedRecords) {
+
+        f.setValidationType(validationType);
+        f.setStatus("FAILED");
+        f.setTimestamp(ts);
+        f.setSourceFile(srcPath);
+        f.setTargetFile(tgtPath);
+
+        // summary counts are stored on each failure for log/JSON consumers
+        f.setPassedCount(safeToInt(passedRecords));
+        f.setFailedCount(safeToInt(failedRecords));
+
+        if (f.getJoinKeys() == null) {
+            f.setJoinKeys(Collections.emptyMap());
+        }
+    }
+
+    private static int safeToInt(long v) {
+        if (v > Integer.MAX_VALUE) return Integer.MAX_VALUE;
+        if (v < Integer.MIN_VALUE) return Integer.MIN_VALUE;
+        return (int) v;
+    }
+
+    @FunctionalInterface
+    public interface MatchDebugListener {
+        void onMatch(String joinKey, Map<String, Object> sourceRow, Map<String, Object> targetRow);
+    }
+
+    @Override
+    public void close() {
+        LOG.info("Closing ParquetService");
+        if (closed) return;
+        closed = true;
+        try {
+            hCtx.close();
+        } catch (Exception ignore) {
+            // Closing context, ignore exceptions as cleanup should not fail
+        }
+        LOG.info("ParquetService closed");
+    }
+}
+
