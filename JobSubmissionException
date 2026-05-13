@@ -1,0 +1,29 @@
+package com.fiserv.fef.exceptions;
+
+/**
+ * Exception for Flink job submission errors
+ */
+public class JobSubmissionException extends FEFValidationException {
+    
+    private String jobName;
+    
+    public JobSubmissionException(String message) {
+        super(message);
+    }
+    
+    public JobSubmissionException(String message, Throwable cause) {
+        super(message, cause);
+    }
+    
+    public JobSubmissionException(String message, String jobName) {
+        super(message);
+        this.jobName = jobName;
+    }
+    
+    public JobSubmissionException(String message, String jobName, Throwable cause) {
+        super(message, cause);
+        this.jobName = jobName;
+    }
+    
+    public String getJobName() { return jobName; }
+}
