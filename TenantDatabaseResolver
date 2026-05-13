@@ -1,0 +1,44 @@
+package com.fiserv.fef.utils;
+
+import com.fiserv.fef.gherkin.ValidationContext;
+import com.mongodb.client.MongoDatabase;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public final class TenantDatabaseResolver {
+
+    private static final Logger LOG = LoggerFactory.getLogger(TenantDatabaseResolver.class);
+
+    private TenantDatabaseResolver() {
+        throw new IllegalStateException("Utility class");
+    }
+
+    public static MongoDatabase resolveDatabase() {
+        ValidationContext context = ValidationContext.getCurrent();
+        if (context != null && context.getSrcTenantDatabase() != null) {
+            MongoDatabase tenantSrcDb = context.getSrcTenantDatabase();
+            LOG.debug("TenantDatabaseResolver: using tenant database '{}'", tenantSrcDb.getName());
+            return tenantSrcDb;
+        }
+        if (context != null && context.getTargetTenantDatabase() != null) {
+            MongoDatabase tenantTargetDb = context.getTargetTenantDatabase();
+            LOG.debug("TenantDatabaseResolver: using tenant database '{}'", tenantTargetDb.getName());
+            return tenantTargetDb;
+        }
+            MongoDatabase primaryDb = MongoDBClientFactory.getDatabase();
+        LOG.debug("TenantDatabaseResolver: using primary database '{}'", primaryDb.getName());
+        return primaryDb;
+    }
+
+    public static String resolveDatabaseName() {
+        ValidationContext context = ValidationContext.getCurrent();
+        if (context != null && context.getSrcTenantDatabase() != null) {
+            return context.getSrcTenantDatabase().getName();
+        }
+        if (context != null && context.getTargetTenantDatabase() != null) {
+            return context.getTargetTenantDatabase().getName();
+        }
+            return MongoDBClientFactory.getDatabase().getName();
+    }
+}
+
