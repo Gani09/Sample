@@ -1,0 +1,52 @@
+package com.fiserv.fef.gherkin;
+
+import com.fiserv.fef.models.ValidationConfig;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * Factory for creating validation executors
+ * Selects appropriate executor based on validation type
+ */
+public class ValidationExecutorFactory {
+
+    private static final Logger LOG = LoggerFactory.getLogger(ValidationExecutorFactory.class);
+
+    // Registered executors
+    private static final List<ValidationExecutor> executors = new ArrayList<>();
+
+    static {
+        // Register built-in executors
+        executors.add(GherkinValidationExecutor.getInstance());
+
+        // Additional executors can be registered here
+        // executors.add(new MongoDBCountExecutor());
+        // executors.add(new KafkaStreamExecutor());
+    }
+
+    /**
+     * Get appropriate executor for validation
+     */
+    public static ValidationExecutor getExecutor(ValidationConfig config) {
+        // Always return GherkinValidationExecutor since only one type is supported
+        return GherkinValidationExecutor.getInstance();
+    }
+
+    /**
+     * Register custom executor
+     */
+    public static void registerExecutor(ValidationExecutor executor) {
+        LOG.info("Registering custom executor: {}", executor.getExecutorType());
+        executors.add(executor);
+    }
+
+    /**
+     * Get all registered executors
+     */
+    public static List<ValidationExecutor> getExecutors() {
+        return new ArrayList<>(executors);
+    }
+}
