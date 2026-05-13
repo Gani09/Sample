@@ -1,0 +1,37 @@
+package com.fiserv.fef.parquet.util;
+
+import java.util.ArrayList;
+import java.util.List;
+
+public final class FieldParser {
+
+    private FieldParser() {
+    }
+
+    public static List<String> parse(String fields) {
+        if (fields == null) {
+            return List.of("*");
+        }
+
+        String s = fields.trim();
+
+        if (s.isEmpty()
+                || "*".equals(s)
+                || "\"\"".equals(s)
+                || "''".equals(s)) {
+            return List.of("*");
+        }
+
+        String[] parts = s.split(",");
+        List<String> out = new ArrayList<>();
+
+        for (String p : parts) {
+            String t = p.trim();
+            if (!t.isEmpty()) {
+                out.add(t);
+            }
+        }
+
+        return out.isEmpty() ? List.of("*") : out;
+    }
+}
