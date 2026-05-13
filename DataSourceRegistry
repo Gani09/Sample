@@ -1,0 +1,73 @@
+package com.fiserv.fef.datasources;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * Registry for custom data source implementations
+ * Allows registering additional data sources at runtime
+ */
+public class DataSourceRegistry {
+
+    private static final Logger LOG = LoggerFactory.getLogger(DataSourceRegistry.class);
+
+    private static final Map<String, Class<? extends DataSource>> registry = new ConcurrentHashMap<>();
+
+    static {
+        // Register built-in data sources
+        register("mongodb_aggregation", MongoAggregationSource.class);
+        register("mongodb_cursor", MongoCursorSource.class);
+        register("flink_dataset", FlinkDataSetSource.class);
+    }
+
+    /**
+     * Register a custom data source
+     */
+    public static void register(String name, Class<? extends DataSource> sourceClass) {
+        LOG.info("Registering data source: {} -> {}", name, sourceClass.getSimpleName());
+        registry.put(name.toLowerCase(), sourceClass);
+    }
+
+    /**
+     * Get data source class by name
+     */
+    public static Class<? extends DataSource> getSourceClass(String name) {
+        return registry.get(name.toLowerCase());
+    }
+
+    /**
+     * Check if data source is registered
+     */
+    public static boolean isRegistered(String name) {
+        return registry.containsKey(name.toLowerCase());
+    }
+
+    /**
+     * Get all registered data source names
+     */
+    public static String[] getRegisteredNames() {
+        return registry.keySet().toArray(new String[0]);
+    }
+
+    /**
+     * Create data source instance by name
+     */
+    public static DataSource createInstance(String name) {
+        Class<? extends DataSource> sourceClass = getSourceClass(name);
+
+        if (sourceClass == null) {
+            LOG.error("Data source not registered: {}", name);
+            throw new IllegalArgumentException("Unknown data source: " + name);
+        }
+
+        try {
+            return sourceClass.getDeclaredConstructor().newInstance();
+        } catch (Exception e) {
+            LOG.error("Failed to create data source instance: {}", name, e);
+            throw new RuntimeException("Failed to create data source: " + name, e);
+        }
+    }
+}
