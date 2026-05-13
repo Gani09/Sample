@@ -1,0 +1,34 @@
+package com.fiserv.fef.parquet.filter;
+
+import com.fiserv.fef.gherkin.SimpleDataTable;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+
+public final class FilterParser {
+
+    private FilterParser() {
+    }
+
+    public static List<FilterCondition> parse(SimpleDataTable table) {
+        List<Map<String, String>> rows = table.asMaps(String.class, String.class);
+        List<FilterCondition> out = new ArrayList<>();
+
+        for (Map<String, String> r : rows) {
+            String key = r.get("filter_key");
+            String val = r.get("filter_value");
+
+            if (key == null || key.isBlank()) {
+                continue;
+            }
+
+            if (val == null || val.isBlank()) {
+                out.add(FilterCondition.joinKeyOnly(key.trim()));
+            } else {
+                out.add(FilterCondition.of(key.trim(), Operator.EQ, val.trim()));
+            }
+        }
+        return out;
+    }
+}
