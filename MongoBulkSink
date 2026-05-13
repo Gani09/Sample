@@ -1,0 +1,137 @@
+package com.fiserv.fef.kafka;
+
+import com.fiserv.fef.utils.MongoDBClientFactory;
+import com.mongodb.client.MongoCollection;
+import com.mongodb.client.MongoDatabase;
+import org.apache.flink.api.connector.sink2.Sink;
+import org.apache.flink.api.connector.sink2.SinkWriter;
+import org.bson.Document;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.locks.ReentrantLock;
+
+public class MongoBulkSink implements Sink<String> {
+    private final String collectionName;
+    private final int batchSize;
+    private final long flushIntervalMs;
+    private final int maxRetries;
+    private final long retryDelayMs;
+
+    public MongoBulkSink(String collectionName, int batchSize, long flushIntervalMs, int maxRetries, long retryDelayMs) {
+        this.collectionName = collectionName;
+        this.batchSize = batchSize;
+        this.flushIntervalMs = flushIntervalMs;
+        this.maxRetries = maxRetries;
+        this.retryDelayMs = retryDelayMs;
+    }
+
+    @Override
+    public SinkWriter<String> createWriter(InitContext context) {
+        return new MongoBulkSinkWriter(collectionName, batchSize, flushIntervalMs, maxRetries, retryDelayMs);
+    }
+
+    public static class MongoBulkSinkWriter implements SinkWriter<String> {
+        private static final Logger LOG = LoggerFactory.getLogger(MongoBulkSinkWriter.class);
+        private final String collectionName;
+        private final int batchSize;
+        private final long flushIntervalMs;
+        private final int maxRetries;
+        private final long retryDelayMs;
+        private final List<Document> buffer = Collections.synchronizedList(new ArrayList<>());
+        private final MongoCollection<Document> collection;
+        private long lastFlush = System.currentTimeMillis();
+        private final ReentrantLock flushLock = new ReentrantLock();
+
+        public MongoBulkSinkWriter(String collectionName, int batchSize, long flushIntervalMs, int maxRetries, long retryDelayMs) {
+            this.collectionName = collectionName;
+            this.batchSize = batchSize;
+            this.flushIntervalMs = flushIntervalMs;
+            this.maxRetries = maxRetries;
+            this.retryDelayMs = retryDelayMs;
+            MongoDatabase db = MongoDBClientFactory.getDatabase();
+            if (db == null) {
+                throw new IllegalStateException("Failed to get MongoDB database from MongoDBClientFactory");
+            }
+            this.collection = db.getCollection(collectionName);
+        }
+
+        @Override
+        public void write(String value, Context context) {
+            Document doc;
+            boolean parsed = false;
+            try {
+                doc = Document.parse(value);
+                parsed = true;
+            } catch (Exception e) {
+                doc = new Document("rawMessage", value)
+                        .append("parseError", e.getMessage());
+            }
+            // Add metadata for traceability
+            doc.append("ingestTimestamp", System.currentTimeMillis());
+            // If context provides topic, add it (Flink context may not always provide this)
+            try {
+                String topic = null;
+                if (context != null && context.getClass().getSimpleName().contains("Kafka")) {
+                    java.lang.reflect.Method m = context.getClass().getMethod("getTopic");
+                    topic = (String) m.invoke(context);
+                }
+                if (topic != null) doc.append("sourceTopic", topic);
+            } catch (Exception ignore) {}
+            buffer.add(doc);
+            boolean shouldFlush = false;
+            synchronized (buffer) {
+                if (buffer.size() >= batchSize || (System.currentTimeMillis() - lastFlush) >= flushIntervalMs) {
+                    shouldFlush = true;
+                }
+            }
+            if (shouldFlush) {
+                flushBatchWithRetry();
+            }
+        }
+
+        private void flushBatchWithRetry() {
+            flushLock.lock();
+            try {
+                List<Document> batch;
+                synchronized (buffer) {
+                    if (buffer.isEmpty()) return;
+                    batch = new ArrayList<>(buffer);
+                    buffer.clear();
+                }
+                int attempt = 0;
+                while (attempt <= maxRetries) {
+                    try {
+                        LOG.info("Flushing {} records to MongoDB collection {} (attempt {}/{})", batch.size(), collectionName, attempt+1, maxRetries+1);
+                        collection.insertMany(batch);
+                        LOG.info("Batch inserted {} records into {}", batch.size(), collectionName);
+                        break;
+                    } catch (Exception e) {
+                        attempt++;
+                        if (attempt > maxRetries) {
+                            LOG.error("Batch insert failed after {} attempts: {}", maxRetries+1, e.getMessage(), e);
+                        } else {
+                            LOG.warn("Batch insert failed (attempt {}/{}), retrying in {} ms: {}", attempt, maxRetries+1, retryDelayMs, e.getMessage());
+                            try { Thread.sleep(retryDelayMs); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); return; }
+                        }
+                    }
+                }
+            } finally {
+                flushLock.unlock();
+            }
+        }
+
+        @Override
+        public void flush(boolean endOfInput) {
+            flushBatchWithRetry();
+        }
+
+        @Override
+        public void close() {
+            flush(true);
+        }
+    }
+}
