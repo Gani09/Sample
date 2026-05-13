@@ -1,0 +1,11 @@
+package com.fiserv.fef.parquet.util;
+
+/**
+ * Internal control-flow exception used to stop a Parquet scan early once enough matches are found.
+ * This is NOT an error; it is caught and treated as a normal termination.
+ */
+public final class StopScanException extends RuntimeException {
+    public StopScanException() {
+        super(null, null, false, false);
+    }
+}
