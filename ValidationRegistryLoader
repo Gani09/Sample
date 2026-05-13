@@ -1,0 +1,121 @@
+package com.fiserv.fef.datasources;
+
+import com.fiserv.fef.models.DataSourceConfig;
+import com.fiserv.fef.models.ValidationConfig;
+import com.fiserv.fef.utils.MongoDBClientFactory;
+import com.mongodb.client.MongoCollection;
+import com.mongodb.client.MongoDatabase;
+import org.bson.Document;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+
+import static com.mongodb.client.model.Filters.and;
+import static com.mongodb.client.model.Filters.eq;
+
+/**
+ * Loader for validation configs and data source configs from fef_validation_registry.
+ * Uses FEF database for registry collections.
+ */
+public class ValidationRegistryLoader {
+    private static final Logger LOG = LoggerFactory.getLogger(ValidationRegistryLoader.class);
+    private static final String VALIDATION_REGISTRY = "fef_validation_registry";
+
+    private final MongoDatabase database;
+    private final MongoCollection<Document> registryCollection;
+
+    public ValidationRegistryLoader() {
+        this.database = MongoDBClientFactory.getFefDatabase();  // Use FEF database
+        this.registryCollection = database.getCollection(VALIDATION_REGISTRY);
+    }
+
+    public ValidationRegistryLoader(MongoDatabase database) {
+        this.database = database;
+        this.registryCollection = database.getCollection(VALIDATION_REGISTRY);
+    }
+
+    /**
+     * Load a single ValidationConfig by processID and validationId
+     */
+    public ValidationConfig loadValidationConfig(String processID, String validationId) {
+        LOG.debug("Loading validation config for processID={}, validationId={}", processID, validationId);
+        try {
+            Document doc = registryCollection.find(and(
+                    eq("processID", processID),
+                    eq("validationID", validationId),
+                    eq("enabled", true)
+            )).first();
+            if (doc == null) {
+                LOG.warn("No validation config found for processID={}, validationId={}", processID, validationId);
+                return null;
+            }
+            return convertToValidationConfig(doc);
+        } catch (Exception e) {
+            LOG.error("Failed to load validation config", e);
+            return null;
+        }
+    }
+
+    /**
+     * Load DataSourceConfig list for a given processID and validationId
+     */
+    public List<DataSourceConfig> loadDataSourceConfigs(String processID, String validationId) {
+        LOG.debug("Loading data source configs for processID={}, validationId={}", processID, validationId);
+        List<DataSourceConfig> configs = new ArrayList<>();
+        try {
+            ValidationConfig config = loadValidationConfig(processID, validationId);
+            if (config == null) {
+                LOG.warn("No ValidationConfig found for processID={}, validationId={}", processID, validationId);
+                return configs;
+            }
+            // Extract execution_profiles from the original document if needed
+            // But since convertToValidationConfig already parses all profiles into targetDataSources,
+            // we can use that, or if you want to distinguish source/target, you can do so here
+            if (config.getTargetDataSources() != null) {
+                configs.addAll(config.getTargetDataSources());
+            }
+        } catch (Exception e) {
+            LOG.error("Failed to load Data Source configs", e);
+        }
+        return configs;
+    }
+
+    /**
+     * Convert MongoDB document to ValidationConfig (reference: TriggerProcessor)
+     */
+    private ValidationConfig convertToValidationConfig(Document doc) {
+        ValidationConfig config = new ValidationConfig();
+        config.setProcessID(doc.getString("processID"));
+        config.setProcessName(doc.getString("processName"));
+        config.setValidationID(doc.getString("validationID"));
+        config.setValName(doc.getString("valName"));
+        config.setValDescription(doc.getString("valDescription"));
+        config.setTrack(doc.getString("track"));
+        config.setOrchestration(doc.getString("orchestration"));
+        config.setProcessStepNumber(doc.getInteger("step_number", 0));
+        config.setExecutionMode(doc.getString("execution_mode"));
+        config.setFeatureID(doc.getString("featureID"));
+        config.setEnabled(doc.getBoolean("enabled", true));
+        // execution_profiles
+        Document profilesDoc = (Document) doc.get("execution_profiles");
+        if (profilesDoc != null) {
+            List<DataSourceConfig> targetDataSources = new ArrayList<>();
+            for (Map.Entry<String, Object> entry : profilesDoc.entrySet()) {
+                String profileRole = entry.getKey(); // e.g., sourceProfile, targetProfile
+                Object value = entry.getValue();
+                if (value instanceof Document profileDoc) {
+                    DataSourceConfig dataSourceConfig = new DataSourceConfig();
+                    dataSourceConfig.setCollection(profileDoc.getString("profileType"));
+                    dataSourceConfig.setTopic(profileDoc.getString("profileName"));
+                    dataSourceConfig.setProfileRole(profileRole); // set source/target role
+                    targetDataSources.add(dataSourceConfig);
+                }
+            }
+            config.setTargetDataSources(targetDataSources);
+        }
+        return config;
+    }
+}
