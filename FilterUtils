@@ -1,0 +1,282 @@
+package com.fiserv.fef.utils;
+
+import com.fiserv.fef.gherkin.SimpleDataTable;
+import com.fiserv.fef.gherkin.ValidationContext;
+import org.bson.Document;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.text.ParseException;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Utility class for building MongoDB filters from Gherkin DataTable
+ * and parsing filter values with type conversion.
+ */
+public class FilterUtils {
+
+    private static final Logger LOG = LoggerFactory.getLogger(FilterUtils.class);
+
+    // Cache SimpleDateFormat instances for better performance (thread-local to avoid synchronization)
+    private static final ThreadLocal<SimpleDateFormat> ISO_FORMAT_WITH_MS =
+        ThreadLocal.withInitial(() -> new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSXXX"));
+
+    private static final ThreadLocal<SimpleDateFormat> ISO_FORMAT_NO_MS =
+        ThreadLocal.withInitial(() -> new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssXXX"));
+
+    private static final ThreadLocal<SimpleDateFormat> ISO_FORMAT_NO_TZ =
+        ThreadLocal.withInitial(() -> new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss"));
+
+    private static final ThreadLocal<SimpleDateFormat> SIMPLE_DATE_FORMAT =
+        ThreadLocal.withInitial(() -> new SimpleDateFormat("yyyy-MM-dd"));
+
+    // Private constructor to prevent instantiation
+    private FilterUtils() {
+        throw new IllegalStateException("Utility class");
+    }
+
+    /**
+     * Build MongoDB filter document from SimpleDataTable
+     *
+     * @param dataTable The SimpleDataTable from Gherkin step
+     * @return MongoDB Document with filter conditions
+     */
+    public static Document buildFilterDocument(SimpleDataTable dataTable) {
+        Document filterDoc = new Document();
+
+        // Handle null or empty data table
+        if (dataTable == null || dataTable.isEmpty()) {
+            LOG.debug("No filter data table provided, returning empty filter");
+            return filterDoc;
+        }
+
+        List<Map<String, String>> rows = dataTable.asMaps(String.class, String.class);
+        return buildFilterFromRows(rows);
+    }
+
+
+    /**
+     * Build filter document from rows (shared logic)
+     */
+    private static Document buildFilterFromRows(List<Map<String, String>> rows) {
+        Document filterDoc = new Document();
+
+        // Get validation context for placeholder replacement
+        ValidationContext context = ValidationContext.getCurrent();
+        String validationDate = context.getValidationDate();
+
+        for (Map<String, String> row : rows) {
+            String filterKey = row.get("filter_key");
+            String condition = row.get("condition");
+            String filterValue = row.get("filter_value");
+            String valueType = row.get("value_type");
+
+            // Replace placeholder with validation date
+            if (filterValue != null && filterValue.contains("{$businessDate}")) {
+                if (validationDate == null || validationDate.isEmpty()) {
+                    throw new IllegalStateException("Placeholder {$businessDate} used but validationDate not set in context");
+                }
+                filterValue = filterValue.replace("{$businessDate}", validationDate);
+                LOG.info("Replaced placeholder {{$businessDate}} with validationDate: {}", validationDate);
+            }
+
+            Object parsedValue = parseFilterValue(filterValue, valueType);
+
+            // Build filter based on condition
+            switch (condition.toLowerCase()) {
+                case "eq":
+                case "equals":
+                    filterDoc.append(filterKey, parsedValue);
+                    break;
+                case "gt":
+                case "greater_than":
+                    filterDoc.append(filterKey, new Document("$gt", parsedValue));
+                    break;
+                case "gte":
+                case "greater_than_or_equal":
+                    filterDoc.append(filterKey, new Document("$gte", parsedValue));
+                    break;
+                case "lt":
+                case "less_than":
+                    filterDoc.append(filterKey, new Document("$lt", parsedValue));
+                    break;
+                case "lte":
+                case "less_than_or_equal":
+                    filterDoc.append(filterKey, new Document("$lte", parsedValue));
+                    break;
+                case "ne":
+                case "not_equal":
+                    filterDoc.append(filterKey, new Document("$ne", parsedValue));
+                    break;
+                case "in":
+                    // For 'in' condition, parse as array
+                    if (filterValue != null) {
+                        String[] values = filterValue.split(",");
+                        List<Object> parsedValues = new ArrayList<>();
+                        for (String val : values) {
+                            parsedValues.add(parseFilterValue(val.trim(), valueType));
+                        }
+                        filterDoc.append(filterKey, new Document("$in", parsedValues));
+                    }
+                    break;
+                case "nin":
+                case "not_in":
+                    // For 'not in' condition, parse as array
+                    if (filterValue != null) {
+                        String[] values = filterValue.split(",");
+                        List<Object> parsedValues = new ArrayList<>();
+                        for (String val : values) {
+                            parsedValues.add(parseFilterValue(val.trim(), valueType));
+                        }
+                        filterDoc.append(filterKey, new Document("$nin", parsedValues));
+                    }
+                    break;
+                case "exists":
+                    // For 'exists' condition, value should be boolean
+                    filterDoc.append(filterKey, new Document("$exists", Boolean.parseBoolean(filterValue)));
+                    break;
+                case "regex":
+                case "matches":
+                    // For regex pattern matching
+                    filterDoc.append(filterKey, new Document("$regex", filterValue));
+                    break;
+                default:
+                    LOG.warn("Unknown condition: {}, defaulting to equals", condition);
+                    filterDoc.append(filterKey, parsedValue);
+            }
+
+            LOG.debug("Applied filter: {} {} {} (type: {})", filterKey, condition, filterValue, valueType);
+        }
+
+        return filterDoc;
+    }
+
+    /**
+     * Parse filter value based on specified type
+     *
+     * @param value The string value to parse
+     * @param type The target type (date, int, long, double, boolean, string)
+     * @return Parsed value as appropriate Java type
+     */
+    public static Object parseFilterValue(String value, String type) {
+        if (value == null) {
+            return null;
+        }
+
+        try {
+            switch (type.toLowerCase()) {
+                case "date":
+                    // Support multiple date formats
+                    return parseDateFlexible(value);
+                case "int":
+                case "integer":
+                    return Integer.parseInt(value);
+                case "long":
+                    return Long.parseLong(value);
+                case "double":
+                case "decimal":
+                    return Double.parseDouble(value);
+                case "boolean":
+                case "bool":
+                    return Boolean.parseBoolean(value);
+                case "string":
+                default:
+                    return value;
+            }
+        } catch (Exception e) {
+            LOG.warn("Failed to parse value '{}' as type '{}', using as string: {}", value, type, e.getMessage());
+            return value;
+        }
+    }
+
+    /**
+     * Parse date with flexible format support (optimized with cached formatters)
+     * Supports ISO 8601 formats and simple date format
+     * Tries most common format first for better performance
+     *
+     * @param dateStr The date string to parse
+     * @return Parsed Date object
+     * @throws IllegalArgumentException if date cannot be parsed
+     */
+    public static Date parseDateFlexible(String dateStr) {
+        if (dateStr == null || dateStr.isEmpty()) {
+            return null;
+        }
+
+        // Try ISO 8601 format with milliseconds first (most common in MongoDB)
+        // Example: 2025-09-10T05:00:00.000+00:00
+        if (dateStr.contains(".")) {
+            try {
+                return ISO_FORMAT_WITH_MS.get().parse(dateStr);
+            } catch (ParseException e) {
+                // Continue to next format
+            }
+        }
+
+        // Try ISO format without milliseconds
+        // Example: 2025-09-10T05:00:00+00:00
+        if (dateStr.contains("T") && (dateStr.contains("+") || dateStr.contains("Z"))) {
+            try {
+                return ISO_FORMAT_NO_MS.get().parse(dateStr);
+            } catch (ParseException e) {
+                // Continue to next format
+            }
+        }
+
+        // Try ISO format without timezone
+        // Example: 2025-09-10T05:00:00
+        if (dateStr.contains("T")) {
+            try {
+                return ISO_FORMAT_NO_TZ.get().parse(dateStr);
+            } catch (ParseException e) {
+                // Continue to next format
+            }
+        }
+
+        // Try simple date format
+        // Example: 2025-09-10
+        try {
+            return SIMPLE_DATE_FORMAT.get().parse(dateStr);
+        } catch (ParseException e) {
+            LOG.error("Failed to parse date: {}", dateStr);
+            throw new IllegalArgumentException("Invalid date format: " + dateStr +
+                    ". Supported formats: yyyy-MM-dd'T'HH:mm:ss.SSSXXX, yyyy-MM-dd'T'HH:mm:ssXXX, yyyy-MM-dd'T'HH:mm:ss, yyyy-MM-dd", e);
+        }
+    }
+
+    /**
+     * Replace placeholders in a string value with context values
+     * Currently supports: {$businessDate}
+     *
+     * @param value The string value that may contain placeholders
+     * @param context The ValidationContext to get values from
+     * @return String with placeholders replaced
+     */
+    public static String replacePlaceholders(String value, ValidationContext context) {
+        if (value == null || context == null) {
+            return value;
+        }
+
+        String result = value;
+
+        // Replace {$businessDate} with validation date
+        if (result.contains("{$businessDate}")) {
+            String validationDate = context.getValidationDate();
+            if (validationDate == null || validationDate.isEmpty()) {
+                throw new IllegalStateException("Placeholder {$businessDate} used but validationDate not set in context");
+            }
+            result = result.replace("{$businessDate}", validationDate);
+            LOG.debug("Replaced {{$businessDate}} with: {}", validationDate);
+        }
+
+        // Add more placeholder types here as needed
+        // Example: {$processID}, {$runID}, etc.
+
+        return result;
+    }
+}
+
