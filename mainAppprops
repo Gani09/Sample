@@ -1,0 +1,145 @@
+# Main Job Configuration
+main.job.polling.interval=10
+
+
+# =====================================================
+# PARALLELISM CONFIGURATION - Three Levels
+# =====================================================
+
+# LEVEL 1: Flink Environment Parallelism
+# flink.default.parallelism: Default parallelism for all Flink operators (unless overridden)
+# This is the base parallelism level for the Flink execution environment
+# Individual operators in the job can override this setting
+flink.default.parallelism=4
+
+# LEVEL 2: Pipeline-Level Parallelism (Flink Operator Parallelism)
+# pipeline.max.triggers.per.poll: How many triggers to pick up from MongoDB in one poll cycle
+# Example: 10 means up to 10 pipelines can be queued for processing at once
+pipeline.max.triggers.per.poll=10
+
+# pipeline.max.concurrent.pipelines: Number of TriggerProcessor instances (Flink parallelism)
+# This is the MAIN JOB parallelism - how many SEPARATE pipelines run concurrently
+# Each pipeline = one (processID + date) combination
+# Example: 5 means 5 different pipelines can be processed at the same time
+# NOTE: This is set via .setParallelism() in MainValidationJob.java
+pipeline.max.concurrent.pipelines=5
+
+# LEVEL 3: Worker Job Parallelism (Separate Flink Jobs)
+# Each pipeline submits multiple worker jobs (one per validation)
+# Worker jobs run as SEPARATE Flink jobs in the cluster
+# Actual concurrency limited by: min(worker.job.max-parallel, available_task_slots)
+# Example: If pipeline has 10 validations ? submits 10 worker jobs
+#          If cluster has 50 task slots ? all 10 run concurrently
+#          If cluster has only 5 task slots ? only 5 run at a time (rest queued)
+
+# MongoDB Configuration
+mongodb.uri=${MONGODB_URI:mongodb://optisdevuser:Welc0me24@otp-mongodb-msr-omh-dev.1dc.com:27017/?authSource=admin&connectTimeoutMS=600000&tls=false}
+# SEP data database (for validation data access)
+mongodb.database=${MONGODB_DATABASE:Card_Issuer_Sync}
+# FEF collections database (for pipeline, registry, results, features)
+mongodb.fef.database=${MONGODB_FEF_DATABASE:Optis_fef_config_db}
+
+# Kafka and SSL configurations
+kafka.topics=otp-dev-servicingorder-account-created:AP-NA-cot-kafka-group,otp_dev_sync_servicing_order_day0:AP-NA-cot-kafka-group,otp-dev-producer-audit:optis-eod,otp_dev_sync_servicing_order_day0:AP-NA-cot-kafka-group
+kafka.bootstrapServer=syld2ak1eki0004.1dc.com:9094, syld2ak1eki0005.1dc.com:9094, syld2ak1eki0006.1dc.com:9094, syld2ak1eki0001.1dc.com:9094, syld2ak1eki0002.1dc.com:9094, syld2ak1eki0003.1dc.com:9094
+kafka.ssl.keystore.location=/work/certs/dev-kafka-keystore.jks
+kafka.ssl.truststore.location=/work/certs/dev-kafka-truststore.jks
+kafka.ssl.pwd=${KAFKA_SSL_PWD}
+# MongoDB Sink configuration
+mongo.sink.batch.size=500
+mongo.sink.flush.interval.ms=2000
+mongo.sink.max.retries=2
+mongo.sink.retry.delay.ms=1000
+
+# Switch between local and HDFS HA
+fs.defaultFS=file:///
+#fs.defaultFS=hdfs://Optis-DEV-NSNode
+
+# Turn this off after debugging (recommended)
+kerberos.debug=false
+krb5.conf.path=/work/etc/krb5_commdev.conf.d/krb5_commdev.conf
+kerberos.keytab=/work/etc/krb5_commdev.conf.d/shortname-cloudera.keytab
+kerberos.principal=wvc-sparkdev@COMMDEV.FISERV.ONE
+
+#record.match.anywhere=true to match the filter values anywhere in the record
+#record.match.anywhere=false to match only at the root level(filter key must be a dot-path)
+record.match.anywhere=true
+# json or text
+validation.output.format=text
+hdfs.file.path=
+# Debug
+parquet.debug.max.matched.records=10
+# Cache size (LRU)
+parquet.footer.cache.max=256
+parquet.diff.max.lines=6000
+#AUTO, METADATA, SCAN
+parquet.row.count.mode=AUTO
+
+# Input Parquet
+parquet.inbound=work/CHMASTER_CITI_INBOUND.parquet
+
+# Filters (supports both nested dot-path and flat top-level)
+parquet.inbound.input.filters=chdAccountNumber:5131460000011079
+parquet.inbound.output.fields=chdCreditLine,chdAccountNumber
+
+# MongoDB Collection Names
+mongodb.collection.pipeline=${MONGODB_COLLECTION_PIPELINE:fef_validation_pipeline}
+mongodb.collection.registry=${MONGODB_COLLECTION_REGISTRY:fef_validation_registry}
+mongodb.collection.results=${MONGODB_COLLECTION_RESULTS:fef_validation_results}
+mongodb.collection.features=${MONGODB_COLLECTION_FEATURES:fef_validation_features}
+mongodb.collection.scores = ${MONGODB_COLLECTION_SCORES:fef_validation_scores}
+
+# Flink Configuration
+# OpenShift/Kubernetes: default to an in-cluster Service name rather than localhost.
+# Override with env `FLINK_JOBMANAGER` or main-job CLI `--flink-jobmanager`.
+flink.jobmanager.address=${FLINK_JOBMANAGER:flink-jobmanager-fef-flink-b:8081}
+flink.checkpoint.interval=60000
+
+# =====================================================
+# WORKER JOB CONFIGURATION
+# =====================================================
+# Worker jobs are SEPARATE Flink jobs submitted by TriggerProcessor
+# Each validation in a pipeline gets its own worker job
+
+worker.job.jar.path=/work/fef-worker-job.jar
+worker.job.timeout=3600000
+
+# worker.job.max-parallel: Maximum concurrent worker jobs to submit at once (per pipeline)
+# This limits how many worker jobs one TriggerProcessor will submit simultaneously
+# Actual concurrency also limited by Flink cluster's available task slots
+# Example: Pipeline with 10 validations + max-parallel=50 ? submits all 10 at once
+#          Pipeline with 100 validations + max-parallel=50 ? submits 50, waits, then 50 more
+worker.job.max-parallel=50
+# https://gitlab.onefiserv.net/issuers/transformed-optis-platform/otp-qa-automation/fiserv-fef/fef-flink-engine-jobs.git
+# worker.job.thread.pool.size: Thread pool size for monitoring worker job status
+# This is used by JobSubmitter to check job completion status concurrently
+# Does NOT affect actual validation execution parallelism
+worker.job.thread.pool.size=20
+
+# =====================================================
+# LEVEL 4: Scenario-Level Parallelism (Java Threads)
+# =====================================================
+# Configured in fef-validation-common/application.properties
+# validation.gherkin.scenario.parallelism: Scenarios per feature file run in parallel
+# This uses Java ExecutorService (NOT Flink parallelism)
+# Example: Feature file with 4 scenarios ? all 4 run concurrently in Java threads
+
+# =====================================================
+# ACTUAL PARALLELISM CALCULATION
+# =====================================================
+# Given:
+# - 5 pipelines (processID/date combinations) picked at once
+# - Each pipeline has 10 validations
+# - Each feature has 4 scenarios
+# - Flink cluster has N task slots
+#
+# Parallelism:
+# 1. Main job: 5 TriggerProcessor instances (Flink parallelism=5)
+# 2. Worker jobs: min(N task_slots, 5x10) = min(N, 50) jobs run concurrently
+# 3. Scenarios: Each worker job runs 4 scenarios in parallel (Java threads)
+#
+# Maximum concurrent scenarios = min(N, 50) x 4
+# - If N=50 task slots: 50 x 4 = 200 scenarios in parallel ?
+# - If N=10 task slots: 10 x 4 = 40 scenarios in parallel
+# - If N=100 task slots: 50 x 4 = 200 scenarios (limited by max-parallel=50)
+# =====================================================
