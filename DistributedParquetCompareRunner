@@ -1,0 +1,507 @@
+package com.fiserv.fef.parquet.distributed;
+
+import org.apache.avro.Schema;
+import org.apache.flink.api.common.JobExecutionResult;
+import org.apache.flink.api.common.accumulators.LongCounter;
+import org.apache.flink.streaming.api.datastream.DataStream;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.functions.sink.RichSinkFunction;
+import org.apache.flink.configuration.Configuration;
+import org.apache.hadoop.fs.Path;
+import org.apache.parquet.avro.AvroSchemaConverter;
+import org.apache.parquet.hadoop.ParquetFileReader;
+import org.apache.parquet.hadoop.metadata.ParquetMetadata;
+import org.apache.parquet.hadoop.util.HadoopInputFile;
+import org.apache.parquet.schema.MessageType;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.*;
+
+/**
+ * Standalone runner for DistributedParquetCompareJob.
+ *
+ * Can be submitted as a Flink job via CLI or programmatically.
+ *
+ * Usage (from inside the JobManager container):
+ *
+ *   flink run -d \
+ *     --jobmanager localhost:8081 \
+ *     -c com.fiserv.fef.parquet.distributed.DistributedParquetCompareRunner \
+ *     /opt/flink/jars/fef-main-job-1.0.0.jar \
+ *     --source-path /work/CHD140_2M_source.parquet \
+ *     --target-path /work/CHD140_2M_target.parquet \
+ *     --join-key chdAccountNumber \
+ *     --parallelism 20 \
+ *     --expected-updates "chdAddrLine1:true,REMAINING:false" \
+ *     --mongo-uri mongodb://localhost:27017 \
+ *     --mongo-db Optis_Dev \
+ *     --results-collection fef_validation_results \
+ *     --validation-id MY_VAL_001 \
+ *     --pipeline-run-id PIPELINE_RUN_123
+ *
+ * Notes:
+ *   - Use -c (not --entry-class) for the entry point class flag.
+ *   - The JAR is fef-main-job-1.0.0.jar (fat jar that includes fef-validation-common).
+ *   - Schema reading (Avro) is done for legacy compatibility but the actual comparison
+ *     uses the Parquet file's native schema via ParallelParquetRowGroupSource —
+ *     no Avro schema is required for correctness.
+ *   - --parallelism controls how many row groups are read in parallel (one per subtask).
+ *     The file must have at least this many row groups for full parallelism.
+ *     CHD140_2M has 20 row groups → parallelism=20 gives full utilisation.
+ */
+public class DistributedParquetCompareRunner {
+
+    private static final Logger LOG = LoggerFactory.getLogger(DistributedParquetCompareRunner.class);
+
+    public static void main(String[] args) throws Exception {
+        LOG.info("=== Starting Distributed Parquet Comparison ===");
+
+        // Parse arguments
+        RunnerConfig config = parseArgs(args);
+        LOG.info("Config: {}", config);
+
+        // Read schema from source and target files independently
+        Schema sourceSchema = readSchemaFromParquet(config.sourcePath);
+        LOG.info("Source schema read: {} fields", sourceSchema.getFields().size());
+        Schema targetSchema = readSchemaFromParquet(config.targetPath);
+        LOG.info("Target schema read: {} fields", targetSchema.getFields().size());
+
+        // Build compare config
+        DistributedParquetCompareJob.CompareConfig compareConfig =
+                new DistributedParquetCompareJob.CompareConfig(
+                        config.sourcePath,
+                        config.targetPath,
+                        config.joinKey,
+                        config.fieldsToCompare,
+                        config.expectedUpdates,
+                        config.validateRemainingUnchanged,
+                        config.parallelism
+                );
+
+        // Create Flink environment
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+        // Execute the comparison pipeline with FileSource (Path A: Maximum Performance)
+        // 🚀 10-20x faster than single-threaded reader
+        LOG.info("🚀 Using FileSource with {} parallel readers for optimal performance", config.parallelism);
+        DataStream<DistributedParquetCompareJob.CompareResult> mismatches =
+                DistributedParquetCompareJob.execute(env, compareConfig, sourceSchema, targetSchema, true);
+
+        // Collect results: count mismatches and sample first N
+        mismatches.addSink(new MismatchCountingSink(
+                        config.maxSampleFailures,
+                        config.mongoUri, config.mongoDatabase, config.resultsCollection,
+                        config.validationId, config.pipelineRunId,
+                        config.sourcePath, config.targetPath))
+                .setParallelism(1)
+                .name("Result-Collector");
+
+        // Execute
+        JobExecutionResult result = env.execute("FEF Distributed Parquet Compare: " + config.joinKey);
+
+        // Get accumulator results
+        Long mismatchCount = result.getAccumulatorResult("mismatch-count");
+        Long missingSource = result.getAccumulatorResult("missing-source");
+        Long missingTarget = result.getAccumulatorResult("missing-target");
+
+        LOG.info("=== Comparison Complete ===");
+        LOG.info("  Mismatches:      {}", mismatchCount);
+        LOG.info("  Missing source:  {}", missingSource);
+        LOG.info("  Missing target:  {}", missingTarget);
+        LOG.info("  RESULT: {}", (mismatchCount == 0 && missingSource == 0 && missingTarget == 0) ? "PASSED" : "FAILED");
+    }
+
+    /**
+     * Read Avro schema from a parquet file's metadata.
+     * Handles the "Can't redefine: element" issue that occurs with nested arrays
+     * by deduplicating named record types.
+     */
+    public static Schema readSchemaFromParquet(String filePath) throws Exception {
+        org.apache.hadoop.conf.Configuration conf = new org.apache.hadoop.conf.Configuration();
+        Path path = new Path(filePath);
+        try (ParquetFileReader reader = ParquetFileReader.open(HadoopInputFile.fromPath(path, conf))) {
+            ParquetMetadata metadata = reader.getFooter();
+            java.util.Map<String, String> kvMetadata = metadata.getFileMetaData().getKeyValueMetaData();
+
+            // Log available metadata keys for debugging
+            LOG.info("Parquet file metadata keys: {}", kvMetadata.keySet());
+
+            // Try reading embedded Avro schema from various known keys
+            String[] schemaKeys = {"avro.schema", "parquet.avro.schema", "writer.model.name", "org.apache.spark.sql.parquet.row.metadata"};
+            for (String key : schemaKeys) {
+                String avroSchemaJson = kvMetadata.get(key);
+                if (avroSchemaJson != null && !avroSchemaJson.isEmpty() && avroSchemaJson.trim().startsWith("{")) {
+                    LOG.info("Using embedded schema from metadata key: '{}'", key);
+                    try {
+                        return new Schema.Parser().parse(avroSchemaJson);
+                    } catch (Exception e) {
+                        LOG.warn("Failed to parse schema from key '{}': {}", key, e.getMessage());
+                    }
+                }
+            }
+
+            // Fallback: Convert Parquet schema to Avro with deduplication
+            MessageType parquetSchema = metadata.getFileMetaData().getSchema();
+            LOG.info("No embedded schema found. Converting parquet schema ({} fields) to Avro", parquetSchema.getFieldCount());
+
+            Schema avroSchema = new AvroSchemaConverter(conf).convert(parquetSchema);
+            LOG.info("Avro schema converted: {} fields", avroSchema.getFields().size());
+
+            // Deduplicate named types by rebuilding with unique namespaces
+            Schema deduped = deduplicateSchema(avroSchema, "root");
+            LOG.info("Schema deduplicated successfully: {} fields", deduped.getFields().size());
+            return deduped;
+        }
+    }
+
+    /**
+     * Counter used to generate unique names for duplicate named types.
+     */
+    private static int deduplicationCounter;
+
+    /**
+     * Recursively rebuild an Avro schema, assigning unique NAMES (not namespaces) to
+     * named types (RECORD, FIXED, ENUM) that may have duplicate names
+     * (e.g., "element" from Parquet array conversions, or FIXED decimal types).
+     *
+     * Why names not namespaces: parquet-avro matches schema elements by field position,
+     * not by Avro type name. Changing names is safe for reading. But Avro's union resolution
+     * (used during serialization) requires the record's full name to match a union type.
+     * If we change namespaces, the records created by the reader (using this schema) would
+     * have the new namespaces, and union resolution would work. BUT in practice, parquet-avro
+     * sometimes creates nested records using its own internal schema objects, which causes
+     * UnresolvedUnionException. Changing names avoids this because all named types become
+     * globally unique regardless of namespace.
+     */
+    private static Schema deduplicateSchema(Schema schema, String path) {
+        // Track seen full names to detect duplicates
+        deduplicationCounter = 0;
+        Map<String, Schema> seenNames = new HashMap<>();
+        return deduplicateSchemaInternal(schema, seenNames);
+    }
+
+    private static Schema deduplicateSchemaInternal(Schema schema, Map<String, Schema> seenNames) {
+        switch (schema.getType()) {
+            case RECORD: {
+                String fullName = schema.getFullName();
+
+                // Check if we've seen this exact Schema object before (identity check)
+                // If same object, return already-processed version
+                Schema existing = seenNames.get(fullName);
+                if (existing != null) {
+                    return existing;
+                }
+
+                // Generate a unique name to avoid "Can't redefine" errors
+                String uniqueName = schema.getName() + "_" + (deduplicationCounter++);
+                String namespace = schema.getNamespace();
+
+                Schema newRecord = Schema.createRecord(uniqueName, schema.getDoc(), namespace, schema.isError());
+                // Register BEFORE processing fields to handle recursive schemas
+                seenNames.put(fullName, newRecord);
+
+                List<Schema.Field> newFields = new ArrayList<>();
+                for (Schema.Field field : schema.getFields()) {
+                    Schema dedupedFieldSchema = deduplicateSchemaInternal(field.schema(), seenNames);
+                    newFields.add(new Schema.Field(
+                            field.name(), dedupedFieldSchema, field.doc(), field.defaultVal()));
+                }
+                newRecord.setFields(newFields);
+                return newRecord;
+            }
+
+            case FIXED: {
+                String uniqueName = schema.getName() + "_" + (deduplicationCounter++);
+                Schema fixedSchema = Schema.createFixed(uniqueName, schema.getDoc(), schema.getNamespace(), schema.getFixedSize());
+                if (schema.getLogicalType() != null) {
+                    schema.getLogicalType().addToSchema(fixedSchema);
+                }
+                return fixedSchema;
+            }
+
+            case ENUM: {
+                String uniqueName = schema.getName() + "_" + (deduplicationCounter++);
+                return Schema.createEnum(uniqueName, schema.getDoc(), schema.getNamespace(), schema.getEnumSymbols());
+            }
+
+            case ARRAY:
+                return Schema.createArray(
+                        deduplicateSchemaInternal(schema.getElementType(), seenNames));
+
+            case MAP:
+                return Schema.createMap(
+                        deduplicateSchemaInternal(schema.getValueType(), seenNames));
+
+            case UNION: {
+                List<Schema> unionTypes = new ArrayList<>();
+                for (Schema unionType : schema.getTypes()) {
+                    unionTypes.add(deduplicateSchemaInternal(unionType, seenNames));
+                }
+                return Schema.createUnion(unionTypes);
+            }
+
+            default:
+                return schema;
+        }
+    }
+
+    /**
+     * Sink that counts mismatches using Flink accumulators and logs samples.
+     * On close(), writes results to MongoDB {@code fef_validation_results} collection
+     * (when mongo-uri is configured) AND to a local result file.
+     */
+    public static class MismatchCountingSink extends RichSinkFunction<DistributedParquetCompareJob.CompareResult> {
+        private static final long serialVersionUID = 1L;
+        private static final Logger LOG = LoggerFactory.getLogger(MismatchCountingSink.class);
+
+        private final int maxSamples;
+        private final String mongoUri;
+        private final String mongoDatabase;
+        private final String resultsCollection;
+        private final String validationId;
+        private final String pipelineRunId;
+        private final String sourcePath;
+        private final String targetPath;
+
+        private transient LongCounter mismatchCounter;
+        private transient LongCounter missingSourceCounter;
+        private transient LongCounter missingTargetCounter;
+        private transient int sampleCount;
+        private transient long mismatchLocal;
+        private transient long missingSourceLocal;
+        private transient long missingTargetLocal;
+        private transient java.util.List<String> mismatchSamples;
+        private transient long openTimeMs;
+
+        public MismatchCountingSink(int maxSamples,
+                                    String mongoUri, String mongoDatabase, String resultsCollection,
+                                    String validationId, String pipelineRunId,
+                                    String sourcePath, String targetPath) {
+            this.maxSamples = maxSamples;
+            this.mongoUri = mongoUri;
+            this.mongoDatabase = mongoDatabase;
+            this.resultsCollection = resultsCollection;
+            this.validationId = validationId;
+            this.pipelineRunId = pipelineRunId;
+            this.sourcePath = sourcePath;
+            this.targetPath = targetPath;
+        }
+
+        /** Backwards-compat constructor (no MongoDB). */
+        public MismatchCountingSink(int maxSamples) {
+            this(maxSamples, null, null, null, null, null, null, null);
+        }
+
+        @Override
+        public void open(Configuration parameters) throws Exception {
+            mismatchCounter = getRuntimeContext().getLongCounter("mismatch-count");
+            missingSourceCounter = getRuntimeContext().getLongCounter("missing-source");
+            missingTargetCounter = getRuntimeContext().getLongCounter("missing-target");
+            sampleCount = 0;
+            mismatchLocal = 0;
+            missingSourceLocal = 0;
+            missingTargetLocal = 0;
+            mismatchSamples = new java.util.ArrayList<>();
+            openTimeMs = System.currentTimeMillis();
+        }
+
+        @Override
+        public void invoke(DistributedParquetCompareJob.CompareResult value, Context context) {
+            if ("SENTINEL_SOURCE".equals(value.getStatus())) {
+                LOG.info("=== SOURCE file finished reading");
+                return;
+            }
+            if ("SENTINEL_TARGET".equals(value.getStatus())) {
+                LOG.info("=== TARGET file finished reading");
+                return;
+            }
+
+            switch (value.getStatus()) {
+                case "MISSING_SOURCE":
+                    missingSourceCounter.add(1);
+                    missingSourceLocal++;
+                    break;
+                case "MISSING_TARGET":
+                    missingTargetCounter.add(1);
+                    missingTargetLocal++;
+                    break;
+                default:
+                    mismatchCounter.add(1);
+                    mismatchLocal++;
+                    break;
+            }
+
+            if (sampleCount < maxSamples) {
+                LOG.warn("[MISMATCH] {}", value);
+                mismatchSamples.add(value.toString());
+                sampleCount++;
+            }
+        }
+
+        @Override
+        public void close() {
+            boolean passed = (mismatchLocal == 0 && missingSourceLocal == 0 && missingTargetLocal == 0);
+            LOG.info("=== FEF Comparison Result ===");
+            LOG.info("  Mismatches:     {}", mismatchLocal);
+            LOG.info("  Missing source: {}", missingSourceLocal);
+            LOG.info("  Missing target: {}", missingTargetLocal);
+            LOG.info("  RESULT:         {}", passed ? "✅ PASSED" : "❌ FAILED");
+
+            // Write to MongoDB if configured
+            if (mongoUri != null && !mongoUri.isEmpty()) {
+                writeToMongoDB(passed);
+            } else {
+                LOG.info("MongoDB not configured — skipping MongoDB write (use --mongo-uri to enable)");
+            }
+        }
+
+        private void writeToMongoDB(boolean passed) {
+            String db = (mongoDatabase != null && !mongoDatabase.isEmpty())
+                    ? mongoDatabase
+                    : System.getenv().getOrDefault("MONGODB_DATABASE", "Optis_Dev");
+            String collection = (resultsCollection != null && !resultsCollection.isEmpty())
+                    ? resultsCollection
+                    : System.getenv().getOrDefault("MONGODB_COLLECTION_RESULTS", "fef_validation_results");
+            String valId = (validationId != null && !validationId.isEmpty())
+                    ? validationId
+                    : "parquet-compare-" + System.currentTimeMillis();
+            String runId = (pipelineRunId != null && !pipelineRunId.isEmpty())
+                    ? pipelineRunId : valId;
+
+            LOG.info("Writing results to MongoDB: {}/{}.{}", mongoUri, db, collection);
+            try (com.mongodb.client.MongoClient client = com.mongodb.client.MongoClients.create(mongoUri)) {
+                com.mongodb.client.MongoCollection<org.bson.Document> col =
+                        client.getDatabase(db).getCollection(collection);
+
+                java.util.List<String> samples = mismatchSamples != null ? mismatchSamples : new java.util.ArrayList<>();
+
+                org.bson.Document doc = new org.bson.Document()
+                        .append("validationID", valId)
+                        .append("pipelineRunID", runId)
+                        .append("source_path", sourcePath)
+                        .append("target_path", targetPath)
+                        .append("passed", passed)
+                        .append("mismatches", mismatchLocal)
+                        .append("missing_source", missingSourceLocal)
+                        .append("missing_target", missingTargetLocal)
+                        .append("mismatch_samples", samples)
+                        .append("feature_name", "distributed_parquet_compare")
+                        .append("duration_ms", System.currentTimeMillis() - openTimeMs)
+                        .append("executed_at", new java.util.Date())
+                        .append("created_at", new java.util.Date())
+                        .append("type", "parquet_compare");
+
+                col.insertOne(doc);
+                LOG.info("✅ Result written to MongoDB collection '{}': passed={}, mismatches={}",
+                        collection, passed, mismatchLocal);
+            } catch (Exception e) {
+                LOG.error("❌ Failed to write result to MongoDB collection '{}': {}", collection, e.getMessage(), e);
+            }
+        }
+    }  // end MismatchCountingSink
+
+    /**
+     * Runner configuration parsed from CLI args.
+     */
+    private static class RunnerConfig {
+        String sourcePath;
+        String targetPath;
+        String joinKey;
+        int parallelism = 4;
+        int maxSampleFailures = 100;
+        List<String> fieldsToCompare = new ArrayList<>();
+        Map<String, Boolean> expectedUpdates = new LinkedHashMap<>();
+        boolean validateRemainingUnchanged = false;
+        // MongoDB output
+        String mongoUri;
+        String mongoDatabase;
+        String resultsCollection;
+        String validationId;
+        String pipelineRunId;
+
+        @Override
+        public String toString() {
+            return String.format("source=%s, target=%s, joinKey=%s, parallelism=%d, fields=%s, updates=%s, mongoUri=%s",
+                    sourcePath, targetPath, joinKey, parallelism, fieldsToCompare, expectedUpdates, mongoUri);
+        }
+    }
+
+    private static RunnerConfig parseArgs(String[] args) {
+        RunnerConfig config = new RunnerConfig();
+        for (int i = 0; i < args.length; i++) {
+            switch (args[i]) {
+                case "--source-path":
+                    config.sourcePath = args[++i];
+                    break;
+                case "--target-path":
+                    config.targetPath = args[++i];
+                    break;
+                case "--join-key":
+                    config.joinKey = args[++i];
+                    break;
+                case "--parallelism":
+                    config.parallelism = Integer.parseInt(args[++i]);
+                    break;
+                case "--max-sample-failures":
+                    config.maxSampleFailures = Integer.parseInt(args[++i]);
+                    break;
+                case "--fields":
+                    config.fieldsToCompare = Arrays.asList(args[++i].split(","));
+                    break;
+                case "--expected-updates":
+                    // Format: "field1:true,field2:false,REMAINING:false"
+                    String[] pairs = args[++i].split(",");
+                    for (String pair : pairs) {
+                        String[] kv = pair.trim().split(":", 2);
+                        if (kv.length == 2) {
+                            if ("REMAINING".equalsIgnoreCase(kv[0].trim())) {
+                                config.validateRemainingUnchanged = !Boolean.parseBoolean(kv[1].trim());
+                            } else {
+                                config.expectedUpdates.put(kv[0].trim(), Boolean.parseBoolean(kv[1].trim()));
+                            }
+                        }
+                    }
+                    break;
+                case "--mongo-uri":
+                    config.mongoUri = args[++i];
+                    break;
+                case "--mongo-db":
+                    config.mongoDatabase = args[++i];
+                    break;
+                case "--results-collection":
+                    config.resultsCollection = args[++i];
+                    break;
+                case "--validation-id":
+                    config.validationId = args[++i];
+                    break;
+                case "--pipeline-run-id":
+                    config.pipelineRunId = args[++i];
+                    break;
+                default:
+                    LOG.warn("Unknown argument: {}", args[i]);
+            }
+        }
+
+        if (config.sourcePath == null || config.targetPath == null || config.joinKey == null) {
+            throw new IllegalArgumentException(
+                    "Required: --source-path, --target-path, --join-key");
+        }
+
+        // Fall back to environment variables for MongoDB settings
+        if (config.mongoUri == null) {
+            config.mongoUri = System.getenv("MONGODB_URI");
+        }
+        if (config.mongoDatabase == null) {
+            config.mongoDatabase = System.getenv("MONGODB_DATABASE");
+        }
+        if (config.resultsCollection == null) {
+            config.resultsCollection = System.getenv().getOrDefault(
+                    "MONGODB_COLLECTION_RESULTS", "fef_validation_results");
+        }
+
+        return config;
+    }
+}
+
+
