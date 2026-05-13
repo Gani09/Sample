@@ -1,0 +1,110 @@
+package com.fiserv.fef.kafka;
+
+import org.apache.flink.connector.kafka.source.KafkaSource;
+import org.apache.flink.streaming.api.datastream.DataStream;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.kafka.clients.admin.AdminClient;
+import org.apache.kafka.clients.admin.DescribeTopicsResult;
+import org.apache.kafka.clients.admin.TopicDescription;
+import org.apache.kafka.common.errors.TopicAuthorizationException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.stream.Collectors;
+
+import static com.fiserv.fef.kafka.KafkaFactory.createKafkaSource;
+
+public class KafkaMultiTopicToDataBase {
+    private static final Logger LOG = LoggerFactory.getLogger(KafkaMultiTopicToDataBase.class);
+    private final KafkaConfig kafkaConfig;
+    private final StreamExecutionEnvironment env;
+
+    public KafkaMultiTopicToDataBase(StreamExecutionEnvironment env, KafkaConfig kafkaConfig) {
+        this.env = env;
+        this.kafkaConfig = kafkaConfig;
+    }
+
+    private Set<String> getAccessibleTopics(List<KafkaConfig.TopicGroup> topicGroups) {
+        Set<String> topicsToCheck = topicGroups.stream().map(tg -> tg.topic).collect(Collectors.toSet());
+        Set<String> accessible = new HashSet<>();
+        final String NOT_ACCESSIBLE_MSG = "Topic '{}' is not accessible or does not exist. Skipping. Cause: {}";
+        try (AdminClient admin = AdminClient.create(kafkaConfig.getKafkaAdminProperties())) {
+            for (String topic : topicsToCheck) {
+                try {
+                    DescribeTopicsResult result = admin.describeTopics(List.of(topic));
+                    TopicDescription desc = result.topicNameValues().get(topic).get();
+                    if (desc != null) {
+                        accessible.add(desc.name());
+                    }
+                } catch (ExecutionException ee) {
+                    Throwable cause = ee.getCause();
+                    if (cause instanceof TopicAuthorizationException) {
+                        LOG.warn("Topic '{}' is not authorized. Skipping.", topic);
+                    } else {
+                        LOG.warn(NOT_ACCESSIBLE_MSG, topic, cause != null ? cause.getMessage() : ee.getMessage());
+                    }
+                } catch (Exception e) {
+                    LOG.warn(NOT_ACCESSIBLE_MSG, topic, e.getMessage());
+                }
+            }
+        } catch (Exception e) {
+            LOG.error("Failed to check topic authorizations. All topics will be skipped.", e);
+            return new HashSet<>();
+        }
+        return accessible;
+    }
+
+    public void buildAndRun() {
+        int topicCount = kafkaConfig.getTopicGroups().size();
+        LOG.info("Starting Flink job for {} topic groups in a single environment", topicCount);
+        env.setParallelism(Math.min(topicCount, 40));
+        List<String> successfulTopics = new ArrayList<>();
+        List<String> failedTopics = new ArrayList<>();
+        Set<String> accessibleTopics = getAccessibleTopics(kafkaConfig.getTopicGroups());
+        LOG.info("Accessible topics after pre-check: {}", accessibleTopics);
+        for (KafkaConfig.TopicGroup tg : kafkaConfig.getTopicGroups()) {
+            String topic = tg.topic;
+            if (!accessibleTopics.contains(topic)) {
+                LOG.warn("[{}] Skipping topic due to lack of access or missing topic.", topic);
+                failedTopics.add(topic);
+                continue;
+            }
+            try {
+                LOG.info("[{}] Creating KafkaSource and DataStream", topic);
+                KafkaSource<String> source = createKafkaSource(kafkaConfig, tg);
+                if (source == null) {
+                    LOG.error("[{}] KafkaSource creation failed. Skipping.", topic);
+                    failedTopics.add(topic);
+                    continue;
+                }
+                DataStream<String> stream = env.fromSource(
+                    source,
+                    org.apache.flink.api.common.eventtime.WatermarkStrategy.noWatermarks(),
+                    "KafkaSource-" + topic
+                );
+                LOG.info("[{}] DataStream created, setting up MongoBulkSink", topic);
+                String mongoCollection = "fef-" + topic.replaceAll("[^a-zA-Z0-9_-]", "_");
+                stream.sinkTo(new MongoBulkSink(
+                    mongoCollection,
+                    kafkaConfig.getMongoSinkBatchSize(),
+                    kafkaConfig.getMongoSinkFlushIntervalMs(),
+                    kafkaConfig.getMongoSinkMaxRetries(),
+                    kafkaConfig.getMongoSinkRetryDelayMs()
+                )).name("MongoBulkSink-" + mongoCollection);
+                LOG.info("[{}] Pipeline configured for topic to collection {}", topic, mongoCollection);
+                successfulTopics.add(topic);
+            } catch (Exception e) {
+                LOG.error("[{}] Error configuring topic pipeline: ", topic, e);
+                failedTopics.add(topic);
+            }
+        }
+        LOG.info("Successfully configured pipelines for topics: {}", successfulTopics);
+        LOG.warn("Failed to configure pipelines for topics: {}", failedTopics);
+        // Removed env.execute() from here. It should be called once in the main class after all pipeline setup.
+    }
+}
