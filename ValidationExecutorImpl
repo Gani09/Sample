@@ -1,0 +1,147 @@
+package com.fiserv.fef.jobs.executors;
+
+import com.fiserv.fef.gherkin.*;
+import com.fiserv.fef.models.ValidationConfig;
+import com.fiserv.fef.models.ValidationResult;
+import com.fiserv.fef.utils.MongoDBClientFactory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * Implementation of validation executor for worker job
+ * Uses GherkinExecutor to run validations
+ */
+public class ValidationExecutorImpl {
+
+    private static final Logger LOG = LoggerFactory.getLogger(ValidationExecutorImpl.class);
+
+    private final GherkinExecutor gherkinExecutor;
+    private final FeatureLoader featureLoader;
+
+    public ValidationExecutorImpl(String featuresCollection) {
+        this.gherkinExecutor = new GherkinExecutor(4);  // 4 scenarios in parallel
+        this.featureLoader = new FeatureLoader(
+                MongoDBClientFactory.getFefDatabase(),  // Use FEF database for features
+                featuresCollection
+        );
+
+        // Initialize step definitions
+        initializeStepDefinitions();
+
+        LOG.info("ValidationExecutorImpl initialized with features collection: {}", featuresCollection);
+    }
+
+    /**
+     * Execute validation
+     */
+    public ValidationResult execute(ValidationConfig config, ValidationContext context) {
+        LOG.info("Executing validation: {}", config.getValidationID());
+
+        long startTime = System.currentTimeMillis();
+
+        try {
+            // Always execute Gherkin validation (no type check)
+            return executeGherkinValidation(config, context);
+        } catch (Exception e) {
+            LOG.error("Validation execution failed: {}", config.getValidationID(), e);
+
+            ValidationResult failureResult = new ValidationResult(config.getValidationID());
+            failureResult.setPassed(false);
+            failureResult.setErrorMessage("Execution error: " + e.getMessage());
+            failureResult.setDurationMs(System.currentTimeMillis() - startTime);
+
+            return failureResult;
+        }
+    }
+
+    /**
+     * Execute Gherkin-based validation
+     */
+    private ValidationResult executeGherkinValidation(
+            ValidationConfig config,
+            ValidationContext context
+    ) {
+        LOG.info("Executing Gherkin validation: {}", config.getValidationID());
+
+        try {
+            // Load Gherkin feature
+            String featureID = config.getFeatureID();
+            if (featureID == null || featureID.isEmpty()) {
+                throw new IllegalArgumentException("No Gherkin feature ID specified");
+            }
+
+            LOG.debug("Loading Gherkin feature: {}", featureID);
+            String featureText = featureLoader.loadFeature(featureID);
+
+            // Set MongoDB client in context
+            context.setMongoClient(MongoDBClientFactory.getClient());
+
+            // Execute feature with GherkinExecutor
+            LOG.debug("Executing feature with GherkinExecutor");
+            ValidationResult result = gherkinExecutor.execute(featureText, context);
+
+            // Set validation ID
+            result.setValidationID(config.getValidationID());
+
+            LOG.info("Gherkin validation completed: passed={}", result.isPassed());
+
+            return result;
+
+        } catch (Exception e) {
+            LOG.error("Gherkin validation failed: {}", config.getValidationID(), e);
+
+            ValidationResult failureResult = new ValidationResult(config.getValidationID());
+            failureResult.setPassed(false);
+            failureResult.setErrorMessage("Gherkin execution failed: " + e.getMessage());
+
+            return failureResult;
+        }
+    }
+
+    /**
+     * Initialize step definitions
+     * Scans and registers all step definition classes
+     */
+    private void initializeStepDefinitions() {
+        LOG.info("Initializing step definitions");
+
+        try {
+            // Scan for step definition classes in stepdefs package
+            java.util.List<Class<?>> stepDefClasses =
+                    StepDefinitionScanner.scanPackage("com.fiserv.fef.stepdefs");
+
+            // Register each class
+            StepDefinitionRegistry registry = gherkinExecutor.getStepRegistry();
+            for (Class<?> stepDefClass : stepDefClasses) {
+                registry.registerStepDefinitionClass(stepDefClass);
+                LOG.debug("Registered step definition class: {}", stepDefClass.getSimpleName());
+            }
+
+            LOG.info("Registered {} step definition classes, {} total steps",
+                    stepDefClasses.size(), registry.getStepDefinitionCount());
+
+        } catch (Exception e) {
+            LOG.error("Failed to initialize step definitions", e);
+            throw new RuntimeException("Failed to initialize step definitions", e);
+        }
+    }
+
+    /**
+     * Get Gherkin executor (for testing)
+     */
+    public GherkinExecutor getGherkinExecutor() {
+        return gherkinExecutor;
+    }
+
+
+    /**
+     * Shutdown executor (cleanup)
+     */
+    public void shutdown() {
+        LOG.info("Shutting down ValidationExecutorImpl");
+
+        if (gherkinExecutor != null) {
+            gherkinExecutor.shutdown();
+        }
+    }
+}
