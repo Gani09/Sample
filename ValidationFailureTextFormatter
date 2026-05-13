@@ -1,0 +1,74 @@
+package com.fiserv.fef.parquet.validation;
+
+/**
+ * Text formatting for ValidationFailure.
+ *
+ * - format(...) renders a complete record block (header + field rows + record end)
+ * - formatFieldRowsOnly(...) renders only the field row(s), used by legacy callers
+ * - formatForAssertion(...) renders only field rows, explicitly for assertion summaries
+ */
+public final class ValidationFailureTextFormatter {
+
+    private static final String RECORD_END = "=================== RECORD END ====================";
+
+    private ValidationFailureTextFormatter() {
+    }
+
+    public static String format(ValidationFailure failure) {
+        StringBuilder sb = new StringBuilder(256);
+        sb.append("Validation FAILED\n");
+        sb.append("joinKeys=").append(failure.getJoinKeys()).append('\n');
+
+        int ffCount = (failure == null || failure.getFieldFailures() == null)
+                ? 0
+                : failure.getFieldFailures().size();
+        sb.append("FieldFailures=").append(ffCount).append("\n\n");
+
+        if (failure != null && failure.getFieldFailures() != null) {
+            for (ValidationFailure.FieldFailure ff : failure.getFieldFailures()) {
+                appendFieldFailureRow(sb, ff);
+            }
+        }
+
+        sb.append(RECORD_END).append("\n\n");
+        return sb.toString();
+    }
+
+    /**
+     * Returns only the field failure rows.
+     */
+    public static String formatFieldRowsOnly(ValidationFailure failure) {
+        if (failure == null || failure.getFieldFailures() == null) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder(256);
+        for (ValidationFailure.FieldFailure ff : failure.getFieldFailures()) {
+            appendFieldFailureRow(sb, ff);
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Assertion-safe formatter:
+     * - No header
+     * - No joinKeys
+     * - No summary counts
+     * - No RECORD END
+     */
+    public static String formatForAssertion(ValidationFailure failure) {
+        return formatFieldRowsOnly(failure);
+    }
+
+    private static void appendFieldFailureRow(StringBuilder sb, ValidationFailure.FieldFailure ff) {
+        sb.append("field=").append(ff.getField())
+                .append(" expected=").append(ff.getExpected())
+                .append(" actual=").append(ff.getActual())
+                .append(" source=").append(nullSafe(ff.getSrc()))
+                .append(" target=").append(nullSafe(ff.getTgt()))
+                .append('\n');
+    }
+
+    private static String nullSafe(Object value) {
+        return value == null ? "" : value.toString();
+    }
+}
