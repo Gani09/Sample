@@ -1,0 +1,42 @@
+package com.fiserv.fef.exceptions;
+
+/**
+ * Exception for data access layer errors
+ */
+public class DataAccessException extends FEFValidationException {
+    
+    private String collection;
+    private String operation;
+    
+    public DataAccessException(String message) {
+        super(message);
+    }
+    
+    public DataAccessException(String message, Throwable cause) {
+        super(message, cause);
+    }
+    
+    public DataAccessException(String message, String collection, String operation) {
+        super(message);
+        this.collection = collection;
+        this.operation = operation;
+    }
+    
+    public DataAccessException(String message, String collection, String operation, Throwable cause) {
+        super(message, cause);
+        this.collection = collection;
+        this.operation = operation;
+    }
+    
+    public String getCollection() { return collection; }
+    public String getOperation() { return operation; }
+    
+    @Override
+    public String toString() {
+        return "DataAccessException{" +
+                "collection='" + collection + '\'' +
+                ", operation='" + operation + '\'' +
+                ", message='" + getMessage() + '\'' +
+                '}';
+    }
+}
