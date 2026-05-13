@@ -1,0 +1,10 @@
+package com.fiserv.fef.parquet.service;
+
+public class ParquetServiceException extends RuntimeException {
+    public ParquetServiceException(String message, Throwable cause) {
+        super(message, cause);
+    }
+    public ParquetServiceException(String message) {
+        super(message);
+    }
+}
