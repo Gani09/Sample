@@ -1,0 +1,242 @@
+package com.fiserv.fef.parquet.distributed;
+
+import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.connector.file.src.FileSourceSplit;
+import org.apache.flink.connector.file.src.reader.BulkFormat;
+import org.apache.flink.connector.file.src.util.RecordAndPosition;
+import org.apache.hadoop.fs.Path;
+import org.apache.parquet.column.page.PageReadStore;
+import org.apache.parquet.example.data.Group;
+import org.apache.parquet.example.data.simple.convert.GroupRecordConverter;
+import org.apache.parquet.hadoop.ParquetFileReader;
+import org.apache.parquet.hadoop.metadata.BlockMetaData;
+import org.apache.parquet.hadoop.metadata.ParquetMetadata;
+import org.apache.parquet.hadoop.util.HadoopInputFile;
+import org.apache.parquet.io.ColumnIOFactory;
+import org.apache.parquet.io.MessageColumnIO;
+import org.apache.parquet.io.RecordReader;
+import org.apache.parquet.schema.MessageType;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import javax.annotation.Nullable;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * A Flink BulkFormat that reads Parquet files using the Parquet Group API.
+ *
+ * Unlike ParquetColumnarRowInputFormat (vectorized reader), this handles ALL
+ * Parquet physical types including DOUBLE, which throws "Unexpected type: DOUBLE"
+ * in the vectorized reader's ParquetSplitReaderUtil.createWritableColumnVector.
+ *
+ * Parallelism is achieved via FileSource row-group level splits.
+ */
+public class ParquetGroupBulkFormat
+        implements BulkFormat<DistributedParquetCompareJob.TaggedRecord, FileSourceSplit> {
+
+    private static final long serialVersionUID = 1L;
+    private static final Logger LOG = LoggerFactory.getLogger(ParquetGroupBulkFormat.class);
+
+    private final String joinKey;
+    private final String side;
+
+    public ParquetGroupBulkFormat(String joinKey, String side) {
+        this.joinKey = joinKey;
+        this.side = side;
+    }
+
+    @Override
+    public Reader<DistributedParquetCompareJob.TaggedRecord> createReader(
+            Configuration config, FileSourceSplit split) throws IOException {
+        return new ParquetGroupReader(split, joinKey, side);
+    }
+
+    @Override
+    public Reader<DistributedParquetCompareJob.TaggedRecord> restoreReader(
+            Configuration config, FileSourceSplit split) throws IOException {
+        return createReader(config, split);
+    }
+
+    @Override
+    public boolean isSplittable() {
+        return true;
+    }
+
+    @Override
+    public TypeInformation<DistributedParquetCompareJob.TaggedRecord> getProducedType() {
+        return TypeInformation.of(DistributedParquetCompareJob.TaggedRecord.class);
+    }
+
+    // -----------------------------------------------------------------------
+
+    private static class ParquetGroupReader
+            implements BulkFormat.Reader<DistributedParquetCompareJob.TaggedRecord> {
+
+        private static final Logger LOG = LoggerFactory.getLogger(ParquetGroupReader.class);
+
+        private final String joinKey;
+        private final String side;
+        private final ParquetFileReader fileReader;
+        private final MessageType schema;
+        private final MessageColumnIO columnIO;
+        private final List<BlockMetaData> relevantBlocks;
+
+        private int currentBlockIndex = 0;
+        private RecordReader<Group> recordReader = null;
+        private long rowsInCurrentBlock = 0;
+        private long rowsReadInCurrentBlock = 0;
+        private long totalRead = 0;
+
+        ParquetGroupReader(FileSourceSplit split, String joinKey, String side) throws IOException {
+            this.joinKey = joinKey;
+            this.side = side;
+
+            long splitStart = split.offset();
+            long splitEnd = split.offset() + split.length();
+            String filePath = split.path().toUri().toString();
+            LOG.info("[{}] Opening parquet split {}:[{},{})", side, filePath, splitStart, splitEnd);
+
+            org.apache.hadoop.conf.Configuration hadoopConf = new org.apache.hadoop.conf.Configuration();
+            this.fileReader = ParquetFileReader.open(
+                    HadoopInputFile.fromPath(new Path(filePath), hadoopConf));
+            ParquetMetadata metadata = fileReader.getFooter();
+            this.schema = metadata.getFileMetaData().getSchema();
+            this.columnIO = new ColumnIOFactory().getColumnIO(schema);
+
+            // Find all row groups that overlap with this split's byte range
+            List<BlockMetaData> allBlocks = metadata.getBlocks();
+            this.relevantBlocks = new ArrayList<>();
+            for (BlockMetaData block : allBlocks) {
+                long blockStart = block.getStartingPos();
+                long blockEnd = blockStart + block.getCompressedSize();
+                if (blockStart < splitEnd && blockEnd > splitStart) {
+                    relevantBlocks.add(block);
+                }
+            }
+            LOG.info("[{}] Split covers {}/{} row groups", side, relevantBlocks.size(), allBlocks.size());
+
+            advanceToNextBlock();
+        }
+
+        private void advanceToNextBlock() throws IOException {
+            if (currentBlockIndex < relevantBlocks.size()) {
+                PageReadStore pages = fileReader.readNextRowGroup();
+                if (pages != null) {
+                    rowsInCurrentBlock = pages.getRowCount();
+                    rowsReadInCurrentBlock = 0;
+                    recordReader = columnIO.getRecordReader(pages, new GroupRecordConverter(schema));
+                } else {
+                    recordReader = null;
+                }
+                currentBlockIndex++;
+            } else {
+                recordReader = null;
+            }
+        }
+
+        @Nullable
+        @Override
+        public BulkFormat.RecordIterator<DistributedParquetCompareJob.TaggedRecord> readBatch() throws IOException {
+            if (recordReader == null) {
+                return null;
+            }
+
+            List<DistributedParquetCompareJob.TaggedRecord> batch = new ArrayList<>(512);
+            long batchBaseOffset = totalRead;
+
+            while (rowsReadInCurrentBlock < rowsInCurrentBlock) {
+                Group group = recordReader.read();
+                if (group == null) {
+                    break;
+                }
+                rowsReadInCurrentBlock++;
+                totalRead++;
+
+                String keyValue = getGroupFieldAsString(group, joinKey);
+                int hash = computeGroupHash(group);
+                batch.add(new DistributedParquetCompareJob.TaggedRecord(keyValue, intToBytes(hash), side));
+
+                if (totalRead % 500_000 == 0) {
+                    LOG.info("[{}] Read {} records", side, totalRead);
+                }
+            }
+
+            // Advance to next row group after finishing current one
+            if (rowsReadInCurrentBlock >= rowsInCurrentBlock) {
+                advanceToNextBlock();
+            }
+
+            if (batch.isEmpty()) {
+                return null;
+            }
+
+            return new ListRecordIterator(batch, batchBaseOffset);
+        }
+
+        @Override
+        public void close() throws IOException {
+            LOG.info("[{}] Closing reader, total read: {}", side, totalRead);
+            fileReader.close();
+        }
+
+        private String getGroupFieldAsString(Group group, String fieldName) {
+            try {
+                int idx = schema.getFieldIndex(fieldName);
+                if (idx < 0 || group.getFieldRepetitionCount(idx) == 0) return "NULL";
+                return group.getValueToString(idx, 0);
+            } catch (Exception e) {
+                return "NULL";
+            }
+        }
+
+        private int computeGroupHash(Group group) {
+            int hash = 1;
+            for (int i = 0; i < schema.getFieldCount(); i++) {
+                int fh = 0;
+                try {
+                    if (group.getFieldRepetitionCount(i) > 0) {
+                        String val = group.getValueToString(i, 0);
+                        fh = val != null ? val.hashCode() : 0;
+                    }
+                } catch (Exception ignored) {}
+                hash = 31 * hash + fh;
+            }
+            return hash;
+        }
+
+        private static byte[] intToBytes(int v) {
+            return new byte[]{(byte)(v>>>24),(byte)(v>>>16),(byte)(v>>>8),(byte)v};
+        }
+    }
+
+    // -----------------------------------------------------------------------
+
+    private static class ListRecordIterator
+            implements BulkFormat.RecordIterator<DistributedParquetCompareJob.TaggedRecord> {
+
+        private final List<DistributedParquetCompareJob.TaggedRecord> records;
+        private final long baseOffset;
+        private int index = 0;
+
+        ListRecordIterator(List<DistributedParquetCompareJob.TaggedRecord> records, long baseOffset) {
+            this.records = records;
+            this.baseOffset = baseOffset;
+        }
+
+        @Nullable
+        @Override
+        public RecordAndPosition<DistributedParquetCompareJob.TaggedRecord> next() {
+            if (index >= records.size()) return null;
+            DistributedParquetCompareJob.TaggedRecord rec = records.get(index);
+            long recordsToSkip = baseOffset + index + 1;
+            index++;
+            return new RecordAndPosition<>(rec, RecordAndPosition.NO_OFFSET, recordsToSkip);
+        }
+
+        @Override
+        public void releaseBatch() {}
+    }
+}
