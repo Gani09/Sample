@@ -1,0 +1,130 @@
+package com.fiserv.fef.gherkin;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.lang.reflect.Method;
+import java.lang.reflect.Parameter;
+import java.util.List;
+
+/**
+ * Represents a matched step definition with extracted arguments
+ */
+public class StepDefinitionMatch {
+
+    private static final Logger LOG = LoggerFactory.getLogger(StepDefinitionMatch.class);
+
+    private final StepDefinitionMethod stepDef;
+    private final List<String> arguments;
+    private final ParsedStep step;
+
+    public StepDefinitionMatch(StepDefinitionMethod stepDef, List<String> arguments, ParsedStep step) {
+        this.stepDef = stepDef;
+        this.arguments = arguments;
+        this.step = step;
+    }
+
+    /**
+     * Execute the matched step definition
+     */
+    public void execute(ValidationContext context) throws Exception {
+        Method method = stepDef.getMethod();
+        Object instance = stepDef.getInstance();
+
+        // Convert string arguments to method parameter types
+        Parameter[] parameters = method.getParameters();
+        Object[] args = new Object[parameters.length];
+
+        LOG.debug("Executing step: {} with {} string arguments and {} total parameters",
+                step.getText(), arguments.size(), parameters.length);
+
+        int argIndex = 0;
+        for (int i = 0; i < parameters.length; i++) {
+            Class<?> paramType = parameters[i].getType();
+
+            LOG.debug("  Parameter {}: type={}, name={}", i, paramType.getSimpleName(), parameters[i].getName());
+
+            // Check if this parameter expects a SimpleDataTable
+            if (paramType == SimpleDataTable.class) {
+                // Create SimpleDataTable from step's data table (if present)
+                if (step.hasDataTable()) {
+                    args[i] = new SimpleDataTable(step.getDataTable());
+                    LOG.debug("    -> Created SimpleDataTable with {} rows", step.getDataTable().size());
+                } else {
+                    args[i] = null;
+                    LOG.debug("    -> No data table present, passing null");
+                }
+                // Don't increment argIndex for DataTable parameters
+            } else if (paramType.getName().equals("io.cucumber.datatable.DataTable")) {
+                // If method expects Cucumber's DataTable, we have a problem
+                throw new IllegalStateException(
+                    "Step definition method expects io.cucumber.datatable.DataTable but this is not supported. " +
+                    "Please use com.fiserv.fef.gherkin.SimpleDataTable instead."
+                );
+            } else {
+                // Regular argument - use captured groups from pattern match
+                if (argIndex < arguments.size()) {
+                    String argValue = arguments.get(argIndex);
+                    try {
+                        args[i] = convertArgument(argValue, paramType);
+                        LOG.debug("    -> Mapped argument[{}]='{}' to type {}", argIndex, argValue, paramType.getSimpleName());
+                    } catch (Exception e) {
+                        LOG.error("Failed to convert argument '{}' to type {}: {}", argValue, paramType.getSimpleName(), e.getMessage());
+                        throw new IllegalArgumentException(
+                            String.format("Cannot convert argument '%s' to type %s for parameter %d of method %s.%s",
+                                argValue, paramType.getSimpleName(), i, instance.getClass().getSimpleName(), method.getName()), e);
+                    }
+                    argIndex++;
+                } else {
+                    // No more string arguments available
+                    // Check if this is an optional parameter or throw error
+                    LOG.warn("    -> No argument available for parameter {} of type {}", i, paramType.getSimpleName());
+                    throw new IllegalArgumentException(
+                        String.format("Missing argument for parameter %d (type: %s) of method %s.%s. Expected %d arguments but got %d.",
+                            i, paramType.getSimpleName(), instance.getClass().getSimpleName(), method.getName(),
+                            parameters.length - (step.hasDataTable() ? 1 : 0), arguments.size()));
+                }
+            }
+        }
+
+        // Invoke method
+        LOG.debug("Invoking method {}.{} with {} arguments",
+                instance.getClass().getSimpleName(), method.getName(), args.length);
+        try {
+            method.invoke(instance, args);
+        } catch (Exception e) {
+            LOG.error("Failed to invoke method {}.{}: {}",
+                instance.getClass().getSimpleName(), method.getName(), e.getMessage());
+            throw e;
+        }
+    }
+
+
+    /**
+     * Convert string argument to target type
+     */
+    private Object convertArgument(String value, Class<?> targetType) {
+        if (targetType == String.class) {
+            return value;
+        } else if (targetType == int.class || targetType == Integer.class) {
+            return Integer.parseInt(value);
+        } else if (targetType == long.class || targetType == Long.class) {
+            return Long.parseLong(value);
+        } else if (targetType == double.class || targetType == Double.class) {
+            return Double.parseDouble(value);
+        } else if (targetType == boolean.class || targetType == Boolean.class) {
+            return Boolean.parseBoolean(value);
+        }
+
+        return value;
+    }
+
+    public StepDefinitionMethod getStepDef() {
+        return stepDef;
+    }
+
+    public List<String> getArguments() {
+        return arguments;
+    }
+}
+
