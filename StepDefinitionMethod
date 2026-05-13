@@ -1,0 +1,37 @@
+package com.fiserv.fef.gherkin;
+
+import java.lang.reflect.Method;
+
+/**
+ * Represents a step definition method
+ */
+public class StepDefinitionMethod {
+
+    private final Object instance;
+    private final Method method;
+    private final String pattern;
+    private final String type;
+
+    public StepDefinitionMethod(Object instance, Method method, String pattern, String type) {
+        this.instance = instance;
+        this.method = method;
+        this.pattern = pattern;
+        this.type = type;
+    }
+
+    public Object getInstance() {
+        return instance;
+    }
+
+    public Method getMethod() {
+        return method;
+    }
+
+    public String getPattern() {
+        return pattern;
+    }
+
+    public String getType() {
+        return type;
+    }
+}
