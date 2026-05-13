@@ -1,0 +1,115 @@
+package com.fiserv.fef.gherkin;
+
+import com.fiserv.fef.exceptions.GherkinExecutionException;
+import com.fiserv.fef.utils.MongoDBClientFactory;
+import com.mongodb.client.MongoCollection;
+import com.mongodb.client.MongoDatabase;
+import org.bson.Document;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import static com.mongodb.client.model.Filters.eq;
+
+/**
+ * Loads Gherkin feature files from MongoDB FEF database
+ */
+public class FeatureLoader {
+
+    private static final Logger LOG = LoggerFactory.getLogger(FeatureLoader.class);
+
+    private final MongoDatabase database;
+    private final String featuresCollectionName;
+
+    public FeatureLoader() {
+        this.database = MongoDBClientFactory.getFefDatabase();  // Use FEF database
+        this.featuresCollectionName = System.getProperty("mongodb.collection.features", "fef_validation_features");
+    }
+
+    public FeatureLoader(MongoDatabase database, String featuresCollectionName) {
+        this.database = database;
+        this.featuresCollectionName = featuresCollectionName;
+    }
+
+    /**
+     * Load feature text by feature ID
+     */
+    public String loadFeature(String featureId) {
+        LOG.debug("Loading feature: {} from collection: {}", featureId, featuresCollectionName);
+
+        try {
+            MongoCollection<Document> collection = database.getCollection(featuresCollectionName);
+
+            Document featureDoc = collection.find(eq("featureID", featureId)).first();
+
+            if (featureDoc == null) {
+                throw new GherkinExecutionException("Feature not found: " + featureId);
+            }
+
+            String featureText = featureDoc.getString("featureText");
+
+            if (featureText == null || featureText.trim().isEmpty()) {
+                throw new GherkinExecutionException("Feature text is empty: " + featureId);
+            }
+
+            LOG.debug("Loaded feature: {} ({} chars)", featureId, featureText.length());
+
+            return featureText;
+
+        } catch (GherkinExecutionException e) {
+            throw e;
+        } catch (Exception e) {
+            LOG.error("Failed to load feature: {}", featureId, e);
+            throw new GherkinExecutionException("Failed to load feature: " + featureId, e);
+        }
+    }
+
+    /**
+     * Check if feature exists and is enabled
+     */
+    public boolean isFeatureEnabled(String featureId) {
+        try {
+            MongoCollection<Document> collection = database.getCollection(featuresCollectionName);
+
+            Document featureDoc = collection.find(eq("featureID", featureId)).first();
+
+            if (featureDoc == null) {
+                return false;
+            }
+
+            Boolean enabled = featureDoc.getBoolean("enabled");
+            return enabled == null || enabled;
+
+        } catch (Exception e) {
+            LOG.error("Failed to check feature status: {}", featureId, e);
+            return false;
+        }
+    }
+
+    /**
+     * Load all enabled features
+     */
+    public java.util.List<String> loadAllEnabledFeatures() {
+        LOG.debug("Loading all enabled features");
+
+        java.util.List<String> features = new java.util.ArrayList<>();
+
+        try {
+            MongoCollection<Document> collection = database.getCollection(featuresCollectionName);
+
+            for (Document doc : collection.find(eq("enabled", true))) {
+                String featureText = doc.getString("featureText");
+                if (featureText != null && !featureText.trim().isEmpty()) {
+                    features.add(featureText);
+                }
+            }
+
+            LOG.debug("Loaded {} enabled features", features.size());
+
+            return features;
+
+        } catch (Exception e) {
+            LOG.error("Failed to load enabled features", e);
+            return features;
+        }
+    }
+}
