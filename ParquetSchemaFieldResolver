@@ -1,0 +1,108 @@
+package com.fiserv.fef.parquet.schema;
+
+import org.apache.parquet.schema.MessageType;
+import org.apache.parquet.schema.Type;
+
+import java.util.*;
+
+/**
+ * Resolves output field tokens (from Gherkin / runner) to Parquet schema paths.
+ * Supports:
+ *  - Explicit dot-path tokens (a.b.c) => exact match required
+ *  - Short leaf tokens (c) => resolves to one or many candidate dot-paths in schema
+ *  - Empty/null => ALL leaf fields (returned in schema order as full dot-paths)
+ */
+public final class ParquetSchemaFieldResolver {
+    private ParquetSchemaFieldResolver() {}
+
+    /** Output plan: for each alias, one or many candidate schema paths. */
+    public static final class OutputFieldPlan {
+        public final List<String> aliases;
+        public final List<List<String>> candidatePaths;
+
+        public OutputFieldPlan(List<String> aliases, List<List<String>> candidatePaths) {
+            this.aliases = Collections.unmodifiableList(new ArrayList<>(aliases));
+            this.candidatePaths = Collections.unmodifiableList(new ArrayList<>(candidatePaths));
+        }
+    }
+
+    /** Build plan using schema. */
+    public static OutputFieldPlan buildOutputPlan(String fieldNames,
+                                                  MessageType schema,
+                                                  boolean allowAmbiguousShortNames) {
+        Objects.requireNonNull(schema, "schema");
+        FlattenedSchema fs = flatten(schema);
+
+        List<String> aliases = new ArrayList<>();
+        List<List<String>> candidates = new ArrayList<>();
+
+        String raw = fieldNames == null ? "" : fieldNames.trim();
+        if (raw.isEmpty()) {
+            // all leaf fields
+            for (String fullPath : fs.leafPathsInOrder) {
+                aliases.add(fullPath);
+                candidates.add(List.of(fullPath));
+            }
+            return new OutputFieldPlan(aliases, candidates);
+        }
+
+        String[] tokens = raw.split(",");
+        for (String t : tokens) {
+            if (t == null) continue;
+            String token = t.trim();
+            if (token.isEmpty()) continue;
+
+            if (token.contains(".")) {
+                if (!fs.allFullPaths.contains(token)) {
+                    throw new IllegalArgumentException("Output field path not found in schema: " + token);
+                }
+                aliases.add(token);
+                candidates.add(List.of(token));
+            } else {
+                List<String> paths = fs.leafToPaths.get(token);
+                if (paths == null || paths.isEmpty()) {
+                    throw new IllegalArgumentException("Output leaf not found in schema: " + token);
+                }
+                if (paths.size() > 1 && !allowAmbiguousShortNames) {
+                    throw new IllegalArgumentException(
+                            "Ambiguous output field '" + token + "' matches multiple paths: " + paths +
+                                    ". Use an explicit dot-path or enable record.match.anywhere."
+                    );
+                }
+                aliases.add(token);
+                candidates.add(new ArrayList<>(paths));
+            }
+        }
+
+        return new OutputFieldPlan(aliases, candidates);
+    }
+
+    private static final class FlattenedSchema {
+        final Map<String, List<String>> leafToPaths = new LinkedHashMap<>();
+        final Set<String> allFullPaths = new HashSet<>();
+        final List<String> leafPathsInOrder = new ArrayList<>();
+    }
+
+    private static FlattenedSchema flatten(MessageType schema) {
+        FlattenedSchema out = new FlattenedSchema();
+        for (Type t : schema.getFields()) {
+            walk("", t, out);
+        }
+        return out;
+    }
+
+    private static void walk(String prefix, Type type, FlattenedSchema out) {
+        String name = type.getName();
+        String path = prefix.isEmpty() ? name : prefix + "." + name;
+        out.allFullPaths.add(path);
+
+        if (type.isPrimitive()) {
+            out.leafPathsInOrder.add(path);
+            out.leafToPaths.computeIfAbsent(name, k -> new ArrayList<>()).add(path);
+        } else {
+            for (Type c : type.asGroupType().getFields()) {
+                walk(path, c, out);
+            }
+        }
+    }
+}
