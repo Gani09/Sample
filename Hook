@@ -1,0 +1,19 @@
+
+package com.fiserv.fef.stepdefs;
+
+import com.fiserv.fef.gherkin.annotations.After;
+import com.fiserv.fef.gherkin.annotations.Before;
+import com.fiserv.fef.parquet.validation.ScenarioContextHolder;
+
+public class Hook {
+
+    @Before
+    public void beforeScenario() {
+        ScenarioContextHolder.init("before-scenario");
+    }
+
+    @After
+    public void afterScenario() {
+        ScenarioContextHolder.clear("after-scenario");
+    }
+}
