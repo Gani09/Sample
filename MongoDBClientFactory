@@ -1,0 +1,241 @@
+package com.fiserv.fef.utils;
+
+import com.mongodb.ConnectionString;
+import com.mongodb.MongoClientSettings;
+import com.mongodb.client.MongoClient;
+import com.mongodb.client.MongoClients;
+import com.mongodb.client.MongoDatabase;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.concurrent.TimeUnit;
+
+/**
+ * Factory for MongoDB client creation and management
+ * Implements connection pooling for efficient resource usage
+ */
+public class MongoDBClientFactory {
+
+    private static final Logger LOG = LoggerFactory.getLogger(MongoDBClientFactory.class);
+
+    private static String DEFAULT_URI;
+    private static String DEFAULT_DATABASE;        // SEP data database
+    private static String DEFAULT_FEF_DATABASE;   // FEF config/results database
+
+    static {
+        java.util.Properties props = new java.util.Properties();
+        try (java.io.InputStream in = MongoDBClientFactory.class.getClassLoader().getResourceAsStream("application.properties")) {
+            if (in != null) {
+                props.load(in);
+                DEFAULT_URI = resolveEnv(props.getProperty("mongodb.uri", "mongodb://localhost:27017"));
+                DEFAULT_DATABASE = resolveEnv(props.getProperty("mongodb.database", "Optis_Dev"));
+                DEFAULT_FEF_DATABASE = resolveEnv(props.getProperty("mongodb.fef.database", "Optis_fef_config_db"));
+            } else {
+                DEFAULT_URI = resolveEnv(System.getenv().getOrDefault("MONGODB_URI", "mongodb://localhost:27017"));
+                DEFAULT_DATABASE = resolveEnv(System.getenv().getOrDefault("MONGODB_DATABASE", "Optis_Dev"));
+                DEFAULT_FEF_DATABASE = resolveEnv(System.getenv().getOrDefault("MONGODB_FEF_DATABASE", "Optis_fef_config_db"));
+            }
+        } catch (Exception e) {
+            DEFAULT_URI = resolveEnv(System.getenv().getOrDefault("MONGODB_URI", "mongodb://localhost:27017"));
+            DEFAULT_DATABASE = resolveEnv(System.getenv().getOrDefault("MONGODB_DATABASE", "Optis_Dev"));
+            DEFAULT_FEF_DATABASE = resolveEnv(System.getenv().getOrDefault("MONGODB_FEF_DATABASE", "Optis_fef_config_db"));
+        }
+        LOG.info("MongoDB URI resolved: {}", maskUri(DEFAULT_URI));
+        LOG.info("MongoDB SEP Database resolved: {}", DEFAULT_DATABASE);
+        LOG.info("MongoDB FEF Database resolved: {}", DEFAULT_FEF_DATABASE);
+    }
+
+    // Singleton instance
+    private static volatile MongoClient instance;
+    private static final Object lock = new Object();
+
+    private MongoDBClientFactory() {
+        // Private constructor for singleton
+    }
+
+    /**
+     * Get or create MongoDB client (singleton with connection pooling)
+     * Thread-safe lazy initialization
+     */
+    public static MongoClient getClient() {
+        if (instance == null) {
+            synchronized (lock) {
+                if (instance == null) {
+                    instance = createClient(DEFAULT_URI);
+                }
+            }
+        }
+        return instance;
+    }
+
+    /**
+     * Get or create MongoDB client with custom URI
+     */
+    public static MongoClient getClient(String uri) {
+        if (instance == null) {
+            synchronized (lock) {
+                if (instance == null) {
+                    instance = createClient(uri);
+                }
+            }
+        }
+        return instance;
+    }
+
+    /**
+     * Create new MongoDB client with connection pooling and retry logic
+     */
+    private static MongoClient createClient(String uri) {
+        LOG.info("Creating MongoDB client: {}", maskUri(uri));
+
+        int maxRetries = 3;
+        int retryDelay = 2000; // 2 seconds
+
+        for (int attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                ConnectionString connectionString = new ConnectionString(uri);
+
+                MongoClientSettings settings = MongoClientSettings.builder()
+                        .applyConnectionString(connectionString)
+                        .applyToConnectionPoolSettings(builder ->
+                                builder.maxSize(50)  // Max connections
+                                        .minSize(5)   // Min connections
+                                        .maxWaitTime(30, TimeUnit.SECONDS)
+                                        .maxConnectionIdleTime(60, TimeUnit.SECONDS)
+                        )
+                        .applyToSocketSettings(builder ->
+                                builder.connectTimeout(15, TimeUnit.SECONDS)  // Increased to 15s
+                                        .readTimeout(60, TimeUnit.SECONDS)      // Increased to 60s
+                        )
+                        .applyToServerSettings(builder ->
+                                builder.heartbeatFrequency(10, TimeUnit.SECONDS)
+                                        .minHeartbeatFrequency(500, TimeUnit.MILLISECONDS)
+                        )
+                        .build();
+
+                MongoClient client = MongoClients.create(settings);
+
+                // Test connection
+                LOG.info("Testing MongoDB connection (attempt {}/{})", attempt, maxRetries);
+                client.getDatabase("admin").runCommand(new org.bson.Document("ping", 1));
+                LOG.info("MongoDB connection successful on attempt {}", attempt);
+
+                return client;
+
+            } catch (Exception e) {
+                LOG.warn("MongoDB connection attempt {}/{} failed: {}", attempt, maxRetries, e.getMessage());
+
+                if (attempt < maxRetries) {
+                    LOG.info("Retrying MongoDB connection in {}ms...", retryDelay);
+                    try {
+                        Thread.sleep(retryDelay);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw new RuntimeException("MongoDB connection retry interrupted", ie);
+                    }
+                    retryDelay *= 2; // Exponential backoff
+                } else {
+                    LOG.error("Failed to connect to MongoDB after {} attempts", maxRetries);
+                    throw new RuntimeException("Failed to establish MongoDB connection after " + maxRetries + " attempts", e);
+                }
+            }
+        }
+
+        throw new RuntimeException("Failed to establish MongoDB connection");
+    }
+
+    /**
+     * Get SEP database instance (for validation data access)
+     */
+    public static MongoDatabase getDatabase() {
+        if (DEFAULT_DATABASE == null || DEFAULT_DATABASE.isEmpty()) {
+            throw new IllegalStateException("MongoDB SEP database name not configured. Please set mongodb.database property or MONGODB_DATABASE environment variable");
+        }
+        MongoClient client = getClient();
+        if (client == null) {
+            throw new IllegalStateException("MongoDB client is null. Connection failed.");
+        }
+        MongoDatabase database = client.getDatabase(DEFAULT_DATABASE);
+        if (database == null) {
+            throw new IllegalStateException("Failed to get MongoDB SEP database: " + DEFAULT_DATABASE);
+        }
+        LOG.debug("Retrieved MongoDB SEP database: {}", DEFAULT_DATABASE);
+        return database;
+    }
+
+    /**
+     * Get FEF database instance (for FEF collections: pipeline, registry, results, features)
+     */
+    public static MongoDatabase getFefDatabase() {
+        if (DEFAULT_FEF_DATABASE == null || DEFAULT_FEF_DATABASE.isEmpty()) {
+            throw new IllegalStateException("MongoDB FEF database name not configured. Please set mongodb.fef.database property or MONGODB_FEF_DATABASE environment variable");
+        }
+        MongoClient client = getClient();
+        if (client == null) {
+            throw new IllegalStateException("MongoDB client is null. Connection failed.");
+        }
+        MongoDatabase database = client.getDatabase(DEFAULT_FEF_DATABASE);
+        if (database == null) {
+            throw new IllegalStateException("Failed to get MongoDB FEF database: " + DEFAULT_FEF_DATABASE);
+        }
+        LOG.debug("Retrieved MongoDB FEF database: {}", DEFAULT_FEF_DATABASE);
+        return database;
+    }
+
+    /**
+     * Get database instance with custom name
+     */
+    public static MongoDatabase getDatabase(String databaseName) {
+        if (databaseName == null || databaseName.isEmpty()) {
+            throw new IllegalArgumentException("Database name cannot be null or empty");
+        }
+        MongoClient client = getClient();
+        if (client == null) {
+            throw new IllegalStateException("MongoDB client is null. Connection failed.");
+        }
+        MongoDatabase database = client.getDatabase(databaseName);
+        if (database == null) {
+            throw new IllegalStateException("Failed to get MongoDB database: " + databaseName);
+        }
+        LOG.debug("Retrieved MongoDB database: {}", databaseName);
+        return database;
+    }
+
+    /**
+     * Close MongoDB client (cleanup)
+     */
+    public static void close() {
+        if (instance != null) {
+            synchronized (lock) {
+                if (instance != null) {
+                    LOG.info("Closing MongoDB client");
+                    instance.close();
+                    instance = null;
+                }
+            }
+        }
+    }
+
+    /**
+     * Mask sensitive information in URI for logging
+     */
+    private static String maskUri(String uri) {
+        if (uri == null) return null;
+        return uri.replaceAll("://[^@]+@", "://***:***@");
+    }
+
+    private static String resolveEnv(String value) {
+        if (value == null) return null;
+        // Simple env substitution: ${ENV:default}
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("\\$\\{([^:}]+):?([^}]*)\\}").matcher(value);
+        StringBuilder sb = new StringBuilder();
+        while (m.find()) {
+            String env = m.group(1);
+            String def = m.group(2);
+            String envVal = System.getenv(env);
+            m.appendReplacement(sb, envVal != null ? envVal : def);
+        }
+        m.appendTail(sb);
+        return sb.toString();
+    }
+}
